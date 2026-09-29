@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "resource3d"
+version = "0.1.0"
+description = "Content-addressed 3D resource import service"
+requires-python = ">=3.10"
+
+[project.scripts]
+resource3d = "resource3d.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["resource3d*"]
