@@ -279,16 +279,26 @@ class GltfImporter:
         if not isinstance(pbr, dict) or not isinstance(color, list) or len(color) != 4:
             self.errors.append(f"materials[{index}] has invalid PBR factor")
             color = [1, 1, 1, 1]
-        if item.get("normalTexture") or item.get("occlusionTexture") or item.get("emissiveTexture"):
-            self.errors.append(f"materials[{index}] uses unsupported normal/occlusion/emissive texture maps")
         if alpha_mode not in {"OPAQUE", "MASK", "BLEND"}:
             self.errors.append(f"materials[{index}] has invalid alphaMode")
             alpha_mode = "OPAQUE"
-        color_texture = None
-        data_texture = None
+        texture_ids: dict[str, str | None] = {
+            "color": None,
+            "data": None,
+            "normal": None,
+            "occlusion": None,
+            "emissive": None,
+        }
         if isinstance(pbr, dict):
-            color_texture = self._texture_binding(pbr, "baseColorTexture", index, "color")
-            data_texture = self._texture_binding(pbr, "metallicRoughnessTexture", index, "data")
+            texture_ids["color"] = self._texture_binding(pbr, "baseColorTexture", index, "color")
+            texture_ids["data"] = self._texture_binding(pbr, "metallicRoughnessTexture", index, "data")
+            texture_ids["normal"] = self._texture_binding(item, "normalTexture", index, "normal")
+            texture_ids["occlusion"] = self._texture_binding(item, "occlusionTexture", index, "occlusion")
+            texture_ids["emissive"] = self._texture_binding(item, "emissiveTexture", index, "emissive")
+        emissive_factor = item.get("emissiveFactor", [0.0, 0.0, 0.0])
+        if not isinstance(emissive_factor, list) or len(emissive_factor) != 3:
+            self.errors.append(f"materials[{index}] has invalid emissiveFactor")
+            emissive_factor = [0.0, 0.0, 0.0]
         try:
             return Material(
                 name=name,
@@ -297,12 +307,28 @@ class GltfImporter:
                 roughness_factor=float(pbr.get("roughnessFactor", 1)),
                 alpha_mode=alpha_mode,
                 double_sided=bool(item.get("doubleSided", False)),
-                color_texture_id=color_texture,
-                data_texture_id=data_texture,
+                color_texture_id=texture_ids["color"],
+                data_texture_id=texture_ids["data"],
+                normal_texture_id=texture_ids["normal"],
+                occlusion_texture_id=texture_ids["occlusion"],
+                emissive_texture_id=texture_ids["emissive"],
+                emissive_factor=tuple(float(value) for value in emissive_factor),
+                normal_scale=self._texture_scale(item, "normalTexture", "scale", index, 1.0),
+                occlusion_strength=self._texture_scale(item, "occlusionTexture", "strength", index, 1.0),
             )
         except (TypeError, ValueError):
             self.errors.append(f"materials[{index}] contains a non-numeric factor")
             return Material(name)
+
+    def _texture_scale(self, item: dict, key: str, field: str, material_index: int, default: float) -> float:
+        info = item.get(key)
+        if not isinstance(info, dict) or field not in info:
+            return default
+        try:
+            return float(info[field])
+        except (TypeError, ValueError):
+            self.errors.append(f"materials[{material_index}].{key}.{field} must be numeric")
+            return default
 
     def _mesh(self, index: int, materials: list[Material]) -> Mesh:
         item = self._objects("meshes")[index]

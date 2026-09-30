@@ -52,7 +52,7 @@ class Image:
 class Texture:
     name: str
     image_id: str
-    usage: Literal["color", "data"]
+    usage: Literal["color", "data", "normal", "occlusion", "emissive"]
     tex_coord: int = 0
 
     def id(self) -> str:
@@ -77,6 +77,12 @@ class Material:
     double_sided: bool = False
     color_texture_id: str | None = None
     data_texture_id: str | None = None
+    normal_texture_id: str | None = None
+    occlusion_texture_id: str | None = None
+    emissive_texture_id: str | None = None
+    emissive_factor: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    normal_scale: float = 1.0
+    occlusion_strength: float = 1.0
 
     def id(self) -> str:
         return content_id("mat", self.data())
@@ -91,6 +97,12 @@ class Material:
             "double_sided": self.double_sided,
             "color_texture_id": self.color_texture_id,
             "data_texture_id": self.data_texture_id,
+            "normal_texture_id": self.normal_texture_id,
+            "occlusion_texture_id": self.occlusion_texture_id,
+            "emissive_texture_id": self.emissive_texture_id,
+            "emissive_factor": list(self.emissive_factor),
+            "normal_scale": self.normal_scale,
+            "occlusion_strength": self.occlusion_strength,
         }
 
 

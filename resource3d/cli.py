@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 from .errors import ImportErrorBundle
 from .library import ResourceLibrary
@@ -16,13 +17,24 @@ def main(argv: list[str] | None = None) -> int:
     export_parser.add_argument("--library", required=True)
     export_parser.add_argument("--asset", required=True)
     export_parser.add_argument("--output", required=True)
+    diff_parser = subparsers.add_parser("diff")
+    diff_parser.add_argument("--library", required=True)
+    diff_parser.add_argument("--old-asset", required=True)
+    diff_parser.add_argument("--new-asset", required=True)
+    diff_parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     library = ResourceLibrary(args.library)
     try:
         if args.command == "import":
             print(library.import_batch(args.manifest))
-        else:
+        elif args.command == "export":
             print(library.export_inspection(args.asset, args.output))
+        else:
+            report = library.compare_assets(args.old_asset, args.new_asset)
+            with open(args.output, "w", encoding="utf-8") as handle:
+                json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+            print(args.output)
     except ImportErrorBundle as exc:
         for error in exc.errors:
             print(f"error: {error}")
