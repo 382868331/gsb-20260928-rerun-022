@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import base64
 from pathlib import Path
 
 from .errors import ImportErrorBundle
 from .gltf import GltfImporter
 from .hashing import canonical_json, sha256_bytes
-from .models import Asset, Geometry, Material, Mesh, Node, Scene
+from .models import Asset, Geometry, Material, Mesh, Node, Scene, Skin, Texture
 
 
 class ResourceLibrary:
@@ -32,12 +33,22 @@ class ResourceLibrary:
         data = json.loads(path.read_text(encoding="utf-8"))
         kind = object_id.split("_", 1)[0]
         if kind == "geo":
+            joints = data.get("joint_indices")
+            weights = data.get("weights")
             return Geometry(
                 tuple(data["positions"]),
                 tuple(data["triangle_indices"]),
                 tuple(data["normals"]) if data.get("normals") is not None else None,
+                tuple(tuple(quad) for quad in joints) if joints is not None else None,
+                tuple(tuple(quad) for quad in weights) if weights is not None else None,
             )
+        if kind == "tex":
+            return Texture(data["name"], data["media_type"], base64.b64decode(data["data"]))
         if kind == "mat":
+            bindings = tuple(
+                (binding["texture_id"], binding["usage"], binding["tex_coord"])
+                for binding in data.get("texture_bindings", [])
+            )
             return Material(
                 data["name"],
                 tuple(data["base_color_factor"]),
@@ -45,6 +56,7 @@ class ResourceLibrary:
                 data["roughness_factor"],
                 data["alpha_mode"],
                 data["double_sided"],
+                bindings,
             )
         if kind == "msh":
             return Mesh(
@@ -53,9 +65,21 @@ class ResourceLibrary:
                 tuple((b["material_id"], b["face_offset"], b["face_count"]) for b in data["material_bindings"]),
             )
         if kind == "ndo":
-            return Node(data["name"], tuple(data["transform"]), data.get("mesh_id"), tuple(data["children"]))
+            return Node(
+                data["name"],
+                tuple(data["transform"]),
+                data.get("mesh_id"),
+                tuple(data["children"]),
+                data.get("skin_id"),
+            )
         if kind == "scn":
             return Scene(data["name"], tuple(data["root_node_ids"]))
+        if kind == "skn":
+            return Skin(
+                data["name"],
+                tuple(data["joint_node_ids"]),
+                tuple(tuple(value) for value in data["inverse_bind_matrices"]),
+            )
         if kind == "ast":
             return Asset(data["source_format"], tuple(data["scene_ids"]))
         raise KeyError(object_id)
@@ -77,8 +101,16 @@ class ResourceLibrary:
             elif isinstance(obj, Node):
                 if obj.mesh_id:
                     visit(obj.mesh_id)
+                if obj.skin_id:
+                    visit(obj.skin_id)
                 for child_id in obj.children:
                     visit(child_id)
+            elif isinstance(obj, Skin):
+                for joint_node_id in obj.joint_node_ids:
+                    visit(joint_node_id)
+            elif isinstance(obj, Material):
+                for texture_id, _usage, _tex_coord in obj.texture_bindings:
+                    visit(texture_id)
             elif isinstance(obj, Scene):
                 for node_id in obj.root_node_ids:
                     visit(node_id)

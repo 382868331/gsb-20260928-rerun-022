@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Tuple
 
 Matrix4 = Tuple[float, ...]
@@ -60,3 +61,22 @@ def transform_point(matrix: Matrix4, point: Vector3) -> Vector3:
 
 def almost_equal_vector(a: Vector3, b: Vector3, tolerance: float = 1e-9) -> bool:
     return all(math.isclose(x, y, abs_tol=tolerance) for x, y in zip(a, b))
+
+
+def skinned_point(
+    point: Vector3,
+    joints: tuple[int, int, int, int],
+    weights: tuple[float, float, float, float],
+    joint_world: list[Matrix4],
+    inverse_bind: list[Matrix4],
+) -> Vector3:
+    x, y, z = (0.0, 0.0, 0.0)
+    for joint_index, weight in zip(joints, weights):
+        if weight == 0.0:
+            continue
+        bound = transform_point(inverse_bind[joint_index], point)
+        world = transform_point(joint_world[joint_index], bound)
+        x += weight * world[0]
+        y += weight * world[1]
+        z += weight * world[2]
+    return (x, y, z)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -11,6 +12,8 @@ class Geometry:
     positions: tuple[float, ...]
     triangle_indices: tuple[int, ...]
     normals: tuple[float, ...] | None = None
+    joint_indices: tuple[tuple[int, int, int, int], ...] | None = None
+    weights: tuple[tuple[float, float, float, float], ...] | None = None
 
     def id(self) -> str:
         return content_id("geo", self.data())
@@ -22,7 +25,28 @@ class Geometry:
         }
         if self.normals is not None:
             data["normals"] = list(self.normals)
+        if self.joint_indices is not None:
+            data["joint_indices"] = [list(value) for value in self.joint_indices]
+        if self.weights is not None:
+            data["weights"] = [list(value) for value in self.weights]
         return data
+
+
+@dataclass(frozen=True)
+class Texture:
+    name: str
+    media_type: str
+    image_bytes: bytes
+
+    def id(self) -> str:
+        return content_id("tex", self.data())
+
+    def data(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "media_type": self.media_type,
+            "data": base64.b64encode(self.image_bytes).decode("ascii"),
+        }
 
 
 @dataclass(frozen=True)
@@ -33,12 +57,13 @@ class Material:
     roughness_factor: float = 1.0
     alpha_mode: Literal["OPAQUE", "MASK", "BLEND"] = "OPAQUE"
     double_sided: bool = False
+    texture_bindings: tuple[tuple[str, str, int], ...] = ()
 
     def id(self) -> str:
         return content_id("mat", self.data())
 
     def data(self) -> dict[str, Any]:
-        return {
+        data = {
             "name": self.name,
             "base_color_factor": list(self.base_color_factor),
             "metallic_factor": self.metallic_factor,
@@ -46,6 +71,12 @@ class Material:
             "alpha_mode": self.alpha_mode,
             "double_sided": self.double_sided,
         }
+        if self.texture_bindings:
+            data["texture_bindings"] = [
+                {"texture_id": texture_id, "usage": usage, "tex_coord": tex_coord}
+                for texture_id, usage, tex_coord in self.texture_bindings
+            ]
+        return data
 
 
 @dataclass(frozen=True)
@@ -74,16 +105,37 @@ class Node:
     transform: tuple[float, ...]
     mesh_id: str | None = None
     children: tuple[str, ...] = field(default_factory=tuple)
+    skin_id: str | None = None
 
     def id(self) -> str:
         return content_id("ndo", self.data())
 
     def data(self) -> dict[str, Any]:
-        return {
+        data = {
             "name": self.name,
             "transform": list(self.transform),
             "mesh_id": self.mesh_id,
             "children": list(self.children),
+        }
+        if self.skin_id is not None:
+            data["skin_id"] = self.skin_id
+        return data
+
+
+@dataclass(frozen=True)
+class Skin:
+    name: str
+    joint_node_ids: tuple[str, ...]
+    inverse_bind_matrices: tuple[tuple[float, ...], ...]
+
+    def id(self) -> str:
+        return content_id("skn", self.data())
+
+    def data(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "joint_node_ids": list(self.joint_node_ids),
+            "inverse_bind_matrices": [list(value) for value in self.inverse_bind_matrices],
         }
 
 
