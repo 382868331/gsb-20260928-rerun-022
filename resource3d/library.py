@@ -8,7 +8,7 @@ from pathlib import Path
 from .errors import ImportErrorBundle
 from .gltf import GltfImporter
 from .hashing import canonical_json, sha256_bytes
-from .models import Asset, Geometry, Material, Mesh, Node, Scene
+from .models import Asset, Geometry, Image, Material, Mesh, Node, Scene, Skin, Texture
 
 
 class ResourceLibrary:
@@ -36,7 +36,13 @@ class ResourceLibrary:
                 tuple(data["positions"]),
                 tuple(data["triangle_indices"]),
                 tuple(data["normals"]) if data.get("normals") is not None else None,
+                tuple(data["skin_joints"]) if data.get("skin_joints") is not None else None,
+                tuple(data["skin_weights"]) if data.get("skin_weights") is not None else None,
             )
+        if kind == "img":
+            return Image(data["name"], data["mime_type"], bytes.fromhex(data["payload"]))
+        if kind == "tex":
+            return Texture(data["name"], data["image_id"], data["usage"], data.get("tex_coord", 0))
         if kind == "mat":
             return Material(
                 data["name"],
@@ -45,6 +51,8 @@ class ResourceLibrary:
                 data["roughness_factor"],
                 data["alpha_mode"],
                 data["double_sided"],
+                data.get("color_texture_id"),
+                data.get("data_texture_id"),
             )
         if kind == "msh":
             return Mesh(
@@ -53,7 +61,19 @@ class ResourceLibrary:
                 tuple((b["material_id"], b["face_offset"], b["face_count"]) for b in data["material_bindings"]),
             )
         if kind == "ndo":
-            return Node(data["name"], tuple(data["transform"]), data.get("mesh_id"), tuple(data["children"]))
+            return Node(
+                data["name"],
+                tuple(data["transform"]),
+                data.get("mesh_id"),
+                tuple(data["children"]),
+                data.get("skin_id"),
+            )
+        if kind == "skn":
+            return Skin(
+                data["name"],
+                tuple(data["joint_node_ids"]),
+                tuple(tuple(matrix) for matrix in data["inverse_bind_matrices"]),
+            )
         if kind == "scn":
             return Scene(data["name"], tuple(data["root_node_ids"]))
         if kind == "ast":
@@ -70,15 +90,28 @@ class ResourceLibrary:
                 return
             obj = self.load_object(object_id)
             collected[object_id] = obj.data()
+            if isinstance(obj, Image):
+                return
+            if isinstance(obj, Texture):
+                visit(obj.image_id)
             if isinstance(obj, Mesh):
                 visit(obj.geometry_id)
                 for material_id, _, _ in obj.material_bindings:
                     visit(material_id)
+            elif isinstance(obj, Material):
+                for texture_id in (obj.color_texture_id, obj.data_texture_id):
+                    if texture_id:
+                        visit(texture_id)
             elif isinstance(obj, Node):
                 if obj.mesh_id:
                     visit(obj.mesh_id)
                 for child_id in obj.children:
                     visit(child_id)
+                if obj.skin_id:
+                    visit(obj.skin_id)
+            elif isinstance(obj, Skin):
+                for joint_id in obj.joint_node_ids:
+                    visit(joint_id)
             elif isinstance(obj, Scene):
                 for node_id in obj.root_node_ids:
                     visit(node_id)

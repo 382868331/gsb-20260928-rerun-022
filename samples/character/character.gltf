@@ -1,0 +1,210 @@
+{
+  "asset": {
+    "version": "2.0",
+    "generator": "resource3d skinned sample"
+  },
+  "buffers": [
+    {
+      "uri": "character.bin",
+      "byteLength": 216
+    },
+    {
+      "uri": "data:application/octet-stream;base64,AACAPwAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAAAAAACAPwAAgD8AAAAAAAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAgL8AAAAAAAAAAAAAgD8=",
+      "byteLength": 128
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 72
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 72,
+      "byteLength": 24
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 96,
+      "byteLength": 24
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 120,
+      "byteLength": 96
+    },
+    {
+      "buffer": 1,
+      "byteOffset": 0,
+      "byteLength": 128
+    }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "count": 6,
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5123,
+      "byteOffset": 0,
+      "count": 12,
+      "type": "SCALAR"
+    },
+    {
+      "bufferView": 2,
+      "componentType": 5121,
+      "count": 6,
+      "type": "VEC4"
+    },
+    {
+      "bufferView": 3,
+      "componentType": 5126,
+      "count": 6,
+      "type": "VEC4"
+    },
+    {
+      "bufferView": 4,
+      "componentType": 5126,
+      "count": 2,
+      "type": "MAT4"
+    }
+  ],
+  "images": [
+    {
+      "name": "paint",
+      "uri": "paint.png"
+    },
+    {
+      "name": "metal-rough",
+      "uri": "data:image/png;base64,iVBORw0KGgpNRVRBTC1ST1VHSC1EQVRB"
+    }
+  ],
+  "textures": [
+    {
+      "name": "paint-srgb",
+      "source": 0
+    },
+    {
+      "name": "metal-rough-linear",
+      "source": 1
+    }
+  ],
+  "materials": [
+    {
+      "name": "armor",
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "baseColorTexture": {
+          "index": 0
+        },
+        "metallicRoughnessTexture": {
+          "index": 1
+        }
+      }
+    },
+    {
+      "name": "trim",
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          0.9,
+          0.9,
+          0.9,
+          1
+        ],
+        "baseColorTexture": {
+          "index": 0,
+          "texCoord": 0
+        }
+      }
+    }
+  ],
+  "meshes": [
+    {
+      "name": "skinned-bar",
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 0,
+            "JOINTS_0": 2,
+            "WEIGHTS_0": 3
+          },
+          "indices": 1,
+          "material": 0
+        }
+      ]
+    }
+  ],
+  "skins": [
+    {
+      "name": "bar-skin",
+      "inverseBindMatrices": 4,
+      "joints": [
+        1,
+        2
+      ],
+      "skeleton": 1
+    }
+  ],
+  "nodes": [
+    {
+      "name": "rig",
+      "rotation": [
+        0,
+        0,
+        0.7071067811865475,
+        0.7071067811865476
+      ],
+      "children": [
+        1,
+        3
+      ]
+    },
+    {
+      "name": "joint-hip",
+      "translation": [
+        0,
+        0,
+        0
+      ],
+      "children": [
+        2
+      ]
+    },
+    {
+      "name": "joint-tip",
+      "translation": [
+        1,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "bar-node",
+      "mesh": 0,
+      "skin": 0,
+      "translation": [
+        0,
+        -2,
+        0
+      ]
+    }
+  ],
+  "scenes": [
+    {
+      "name": "skinned-character",
+      "nodes": [
+        0
+      ]
+    }
+  ],
+  "scene": 0
+}

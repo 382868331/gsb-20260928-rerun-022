@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Tuple
 
 Matrix4 = Tuple[float, ...]
@@ -60,3 +61,54 @@ def transform_point(matrix: Matrix4, point: Vector3) -> Vector3:
 
 def almost_equal_vector(a: Vector3, b: Vector3, tolerance: float = 1e-9) -> bool:
     return all(math.isclose(x, y, abs_tol=tolerance) for x, y in zip(a, b))
+
+
+def inverse(matrix: Matrix4) -> Matrix4:
+    values = [list(matrix[row * 4:row * 4 + 4]) for row in range(4)]
+    identity = [[float(row == column) for column in range(4)] for row in range(4)]
+    for column in range(4):
+        pivot = max(range(column, 4), key=lambda row: abs(values[row][column]))
+        if abs(values[pivot][column]) < 1e-12:
+            raise ValueError("matrix is not invertible")
+        if pivot != column:
+            values[column], values[pivot] = values[pivot], values[column]
+            identity[column], identity[pivot] = identity[pivot], identity[column]
+        pivot_value = values[column][column]
+        values[column] = [value / pivot_value for value in values[column]]
+        identity[column] = [value / pivot_value for value in identity[column]]
+        for row in range(4):
+            if row == column:
+                continue
+            factor = values[row][column]
+            values[row] = [a - factor * b for a, b in zip(values[row], values[column])]
+            identity[row] = [a - factor * b for a, b in zip(identity[row], identity[column])]
+    return tuple(value for row in identity for value in row)
+
+
+def skin_matrix(
+    joints: tuple[int, ...],
+    weights: tuple[float, ...],
+    joint_world: list[Matrix4],
+    inverse_bind: list[Matrix4],
+) -> Matrix4:
+    blended = [0.0] * 16
+    for joint, weight in zip(joints, weights):
+        if weight == 0.0:
+            continue
+        palette = multiply(joint_world[joint], inverse_bind[joint])
+        for index, value in enumerate(palette):
+            blended[index] += weight * value
+    return tuple(blended)
+
+
+def skin_point(
+    point: Vector3,
+    joints: tuple[int, ...],
+    weights: tuple[float, ...],
+    joint_world: list[Matrix4],
+    inverse_bind: list[Matrix4],
+) -> Vector3:
+    return transform_point(
+        skin_matrix(joints, weights, joint_world, inverse_bind),
+        point,
+    )

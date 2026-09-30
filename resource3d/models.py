@@ -11,6 +11,8 @@ class Geometry:
     positions: tuple[float, ...]
     triangle_indices: tuple[int, ...]
     normals: tuple[float, ...] | None = None
+    skin_joints: tuple[int, ...] | None = None
+    skin_weights: tuple[float, ...] | None = None
 
     def id(self) -> str:
         return content_id("geo", self.data())
@@ -22,7 +24,47 @@ class Geometry:
         }
         if self.normals is not None:
             data["normals"] = list(self.normals)
+        if self.skin_joints is not None:
+            data["skin_joints"] = list(self.skin_joints)
+        if self.skin_weights is not None:
+            data["skin_weights"] = list(self.skin_weights)
         return data
+
+
+@dataclass(frozen=True)
+class Image:
+    name: str
+    mime_type: str
+    payload: bytes
+
+    def id(self) -> str:
+        return content_id("img", self.data())
+
+    def data(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "mime_type": self.mime_type,
+            "payload": self.payload.hex(),
+        }
+
+
+@dataclass(frozen=True)
+class Texture:
+    name: str
+    image_id: str
+    usage: Literal["color", "data"]
+    tex_coord: int = 0
+
+    def id(self) -> str:
+        return content_id("tex", self.data())
+
+    def data(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "image_id": self.image_id,
+            "usage": self.usage,
+            "tex_coord": self.tex_coord,
+        }
 
 
 @dataclass(frozen=True)
@@ -33,6 +75,8 @@ class Material:
     roughness_factor: float = 1.0
     alpha_mode: Literal["OPAQUE", "MASK", "BLEND"] = "OPAQUE"
     double_sided: bool = False
+    color_texture_id: str | None = None
+    data_texture_id: str | None = None
 
     def id(self) -> str:
         return content_id("mat", self.data())
@@ -45,6 +89,8 @@ class Material:
             "roughness_factor": self.roughness_factor,
             "alpha_mode": self.alpha_mode,
             "double_sided": self.double_sided,
+            "color_texture_id": self.color_texture_id,
+            "data_texture_id": self.data_texture_id,
         }
 
 
@@ -74,6 +120,7 @@ class Node:
     transform: tuple[float, ...]
     mesh_id: str | None = None
     children: tuple[str, ...] = field(default_factory=tuple)
+    skin_id: str | None = None
 
     def id(self) -> str:
         return content_id("ndo", self.data())
@@ -84,6 +131,24 @@ class Node:
             "transform": list(self.transform),
             "mesh_id": self.mesh_id,
             "children": list(self.children),
+            "skin_id": self.skin_id,
+        }
+
+
+@dataclass(frozen=True)
+class Skin:
+    name: str
+    joint_node_ids: tuple[str, ...]
+    inverse_bind_matrices: tuple[tuple[float, ...], ...]
+
+    def id(self) -> str:
+        return content_id("skn", self.data())
+
+    def data(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "joint_node_ids": list(self.joint_node_ids),
+            "inverse_bind_matrices": [list(matrix) for matrix in self.inverse_bind_matrices],
         }
 
 
