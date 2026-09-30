@@ -53,6 +53,12 @@ def write_skinned_sample(destination: Path) -> Path:
     data_png = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + b"METAL-ROUGH-DATA"
     (destination / "paint.png").write_bytes(color_png)
     data_uri = "data:image/png;base64," + base64.b64encode(data_png).decode("ascii")
+    # The same image backs both a tangent-space normal map and an occlusion
+    # map; each binding keeps its own usage/interpretation.
+    surface_png = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + b"NORMAL-OCCLUSION-DATA"
+    surface_uri = "data:image/png;base64," + base64.b64encode(surface_png).decode("ascii")
+    glow_png = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + b"EMISSIVE-SURFACE"
+    glow_uri = "data:image/png;base64," + base64.b64encode(glow_png).decode("ascii")
 
     identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
     # Joint 1 is authored at x=1, so its inverse bind matrix translates back.
@@ -82,19 +88,28 @@ def write_skinned_sample(destination: Path) -> Path:
         "images": [
             {"name": "paint", "uri": "paint.png"},
             {"name": "metal-rough", "uri": data_uri},
+            {"name": "surface", "uri": surface_uri},
+            {"name": "glow", "uri": glow_uri},
         ],
         "textures": [
             {"name": "paint-srgb", "source": 0},
             {"name": "metal-rough-linear", "source": 1},
+            {"name": "surface-normal", "source": 2},
+            {"name": "surface-occlusion", "source": 2},
+            {"name": "glow-emissive", "source": 3},
         ],
         "materials": [
             {
                 "name": "armor",
+                "emissiveFactor": [0.1, 0.0, 0.0],
                 "pbrMetallicRoughness": {
                     "baseColorFactor": [1, 1, 1, 1],
                     "baseColorTexture": {"index": 0},
                     "metallicRoughnessTexture": {"index": 1},
                 },
+                "normalTexture": {"index": 2, "scale": 1.0},
+                "occlusionTexture": {"index": 3, "strength": 0.8},
+                "emissiveTexture": {"index": 4},
             },
             {
                 "name": "trim",

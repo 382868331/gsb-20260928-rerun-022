@@ -81,6 +81,14 @@
     {
       "name": "metal-rough",
       "uri": "data:image/png;base64,iVBORw0KGgpNRVRBTC1ST1VHSC1EQVRB"
+    },
+    {
+      "name": "surface",
+      "uri": "data:image/png;base64,iVBORw0KGgpOT1JNQUwtT0NDTFVTSU9OLURBVEE="
+    },
+    {
+      "name": "glow",
+      "uri": "data:image/png;base64,iVBORw0KGgpFTUlTU0lWRS1TVVJGQUNF"
     }
   ],
   "textures": [
@@ -91,11 +99,28 @@
     {
       "name": "metal-rough-linear",
       "source": 1
+    },
+    {
+      "name": "surface-normal",
+      "source": 2
+    },
+    {
+      "name": "surface-occlusion",
+      "source": 2
+    },
+    {
+      "name": "glow-emissive",
+      "source": 3
     }
   ],
   "materials": [
     {
       "name": "armor",
+      "emissiveFactor": [
+        0.1,
+        0.0,
+        0.0
+      ],
       "pbrMetallicRoughness": {
         "baseColorFactor": [
           1,
@@ -109,6 +134,17 @@
         "metallicRoughnessTexture": {
           "index": 1
         }
+      },
+      "normalTexture": {
+        "index": 2,
+        "scale": 1.0
+      },
+      "occlusionTexture": {
+        "index": 3,
+        "strength": 0.8
+      },
+      "emissiveTexture": {
+        "index": 4
       }
     },
     {

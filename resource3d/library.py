@@ -10,6 +10,8 @@ from .gltf import GltfImporter
 from .hashing import canonical_json, sha256_bytes
 from .models import Asset, Geometry, Image, Material, Mesh, Node, Scene, Skin, Texture
 
+TEXTURE_USAGES = ("color", "data", "normal", "occlusion", "emissive")
+
 
 class ResourceLibrary:
     def __init__(self, root: Path | str):
@@ -45,14 +47,18 @@ class ResourceLibrary:
             return Texture(data["name"], data["image_id"], data["usage"], data.get("tex_coord", 0))
         if kind == "mat":
             return Material(
-                data["name"],
-                tuple(data["base_color_factor"]),
-                data["metallic_factor"],
-                data["roughness_factor"],
-                data["alpha_mode"],
-                data["double_sided"],
-                data.get("color_texture_id"),
-                data.get("data_texture_id"),
+                name=data["name"],
+                base_color_factor=tuple(data["base_color_factor"]),
+                metallic_factor=data["metallic_factor"],
+                roughness_factor=data["roughness_factor"],
+                emissive_factor=tuple(data.get("emissive_factor", [0.0, 0.0, 0.0])),
+                alpha_mode=data["alpha_mode"],
+                double_sided=data["double_sided"],
+                color_texture_id=data.get("color_texture_id"),
+                data_texture_id=data.get("data_texture_id"),
+                normal_texture_id=data.get("normal_texture_id"),
+                occlusion_texture_id=data.get("occlusion_texture_id"),
+                emissive_texture_id=data.get("emissive_texture_id"),
             )
         if kind == "msh":
             return Mesh(
@@ -81,6 +87,16 @@ class ResourceLibrary:
         raise KeyError(object_id)
 
     def export_inspection(self, asset_id: str, destination: Path | str) -> Path:
+        collected = self._collect_closure(asset_id)
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps({"asset_id": asset_id, "objects": collected}, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return destination
+
+    def _collect_closure(self, asset_id: str) -> dict[str, object]:
         asset = self.load_object(asset_id)
         assert isinstance(asset, Asset)
         collected: dict[str, object] = {}
@@ -99,7 +115,7 @@ class ResourceLibrary:
                 for material_id, _, _ in obj.material_bindings:
                     visit(material_id)
             elif isinstance(obj, Material):
-                for texture_id in (obj.color_texture_id, obj.data_texture_id):
+                for texture_id in obj.texture_slots().values():
                     if texture_id:
                         visit(texture_id)
             elif isinstance(obj, Node):
@@ -120,13 +136,98 @@ class ResourceLibrary:
                     visit(scene_id)
 
         visit(asset_id)
-        destination = Path(destination)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(
-            json.dumps({"asset_id": asset_id, "objects": collected}, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        return destination
+        return collected
+
+    def material_update_report(self, old_asset_id: str, new_asset_id: str) -> dict[str, object]:
+        """Compare two asset versions and report material-local updates.
+
+        Only materials whose content changed are reported.  Each entry lists
+        the texture usages that changed (added/removed/replaced binding, and
+        the underlying shared image reference) and the mesh/node objects that
+        use the material in each version.
+        """
+        old_objects = self._collect_closure(old_asset_id)
+        new_objects = self._collect_closure(new_asset_id)
+        old_materials = {value["name"]: (key, value) for key, value in old_objects.items() if "base_color_factor" in value}
+        new_materials = {value["name"]: (key, value) for key, value in new_objects.items() if "base_color_factor" in value}
+
+        def image_of(objects: dict[str, object], texture_id: str | None) -> str | None:
+            if not texture_id:
+                return None
+            texture = objects.get(texture_id)
+            return texture["image_id"] if texture else None  # type: ignore[index]
+
+        def users(objects: dict[str, object], material_id: str) -> dict[str, list[str]]:
+            mesh_names = sorted(
+                value["name"]
+                for value in objects.values()
+                if "material_bindings" in value
+                and any(binding["material_id"] == material_id for binding in value["material_bindings"])
+            )
+            mesh_ids = {
+                key
+                for key, value in objects.items()
+                if "material_bindings" in value
+                and any(binding["material_id"] == material_id for binding in value["material_bindings"])
+            }
+            node_names = sorted(
+                value["name"]
+                for value in objects.values()
+                if value.get("mesh_id") in mesh_ids
+            )
+            return {"meshes": mesh_names, "nodes": node_names}
+
+        changed: list[dict[str, object]] = []
+        for name in sorted(set(old_materials) & set(new_materials)):
+            old_id, old_material = old_materials[name]
+            new_id, new_material = new_materials[name]
+            if old_id == new_id:
+                continue
+            usage_changes: list[dict[str, object]] = []
+            for usage in TEXTURE_USAGES:
+                slot = f"{usage}_texture_id"
+                old_texture = old_material.get(slot)
+                new_texture = new_material.get(slot)
+                old_image = image_of(old_objects, old_texture)
+                new_image = image_of(new_objects, new_texture)
+                if old_texture == new_texture and old_image == new_image:
+                    continue
+                if not old_texture and new_texture:
+                    change = "added"
+                elif old_texture and not new_texture:
+                    change = "removed"
+                else:
+                    change = "replaced"
+                usage_changes.append({
+                    "usage": usage,
+                    "change": change,
+                    "old_texture_id": old_texture,
+                    "new_texture_id": new_texture,
+                    "old_image_id": old_image,
+                    "new_image_id": new_image,
+                })
+            factor_changes: dict[str, dict[str, object]] = {}
+            for factor in ("base_color_factor", "metallic_factor", "roughness_factor", "emissive_factor", "alpha_mode", "double_sided"):
+                if old_material.get(factor) != new_material.get(factor):
+                    factor_changes[factor] = {"old": old_material.get(factor), "new": new_material.get(factor)}
+            changed.append({
+                "name": name,
+                "old_material_id": old_id,
+                "new_material_id": new_id,
+                "usage_changes": usage_changes,
+                "factor_changes": factor_changes,
+                "users_before": users(old_objects, old_id),
+                "users_after": users(new_objects, new_id),
+            })
+        added = sorted(name for name in new_materials if name not in old_materials)
+        removed = sorted(name for name in old_materials if name not in new_materials)
+        return {
+            "old_asset_id": old_asset_id,
+            "new_asset_id": new_asset_id,
+            "changed_materials": changed,
+            "added_materials": added,
+            "removed_materials": removed,
+        }
 
     def _record(self, value: object) -> dict[str, str]:
         object_id = value.id()  # type: ignore[attr-defined]

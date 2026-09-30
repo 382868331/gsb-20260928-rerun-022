@@ -279,26 +279,46 @@ class GltfImporter:
         if not isinstance(pbr, dict) or not isinstance(color, list) or len(color) != 4:
             self.errors.append(f"materials[{index}] has invalid PBR factor")
             color = [1, 1, 1, 1]
-        if item.get("normalTexture") or item.get("occlusionTexture") or item.get("emissiveTexture"):
-            self.errors.append(f"materials[{index}] uses unsupported normal/occlusion/emissive texture maps")
         if alpha_mode not in {"OPAQUE", "MASK", "BLEND"}:
             self.errors.append(f"materials[{index}] has invalid alphaMode")
             alpha_mode = "OPAQUE"
         color_texture = None
         data_texture = None
+        normal_texture = None
+        occlusion_texture = None
+        emissive_texture = None
         if isinstance(pbr, dict):
             color_texture = self._texture_binding(pbr, "baseColorTexture", index, "color")
             data_texture = self._texture_binding(pbr, "metallicRoughnessTexture", index, "data")
+        normal_texture = self._texture_binding(item, "normalTexture", index, "normal")
+        occlusion_texture = self._texture_binding(item, "occlusionTexture", index, "occlusion")
+        emissive_texture = self._texture_binding(item, "emissiveTexture", index, "emissive")
+        emissive_factor = item.get("emissiveFactor", [0.0, 0.0, 0.0])
+        if not isinstance(emissive_factor, list) or len(emissive_factor) != 3:
+            self.errors.append(f"materials[{index}].emissiveFactor must contain 3 numbers")
+            emissive_factor = [0.0, 0.0, 0.0]
+        for container_name, container, keys in (
+            (f"materials[{index}].normalTexture", item.get("normalTexture"), {"scale"}),
+            (f"materials[{index}].occlusionTexture", item.get("occlusionTexture"), {"strength"}),
+        ):
+            if isinstance(container, dict):
+                for key in container:
+                    if key not in {"index", "texCoord", "extensions"} and key not in keys:
+                        self.errors.append(f"{container_name} has unsupported field {key!r}")
         try:
             return Material(
                 name=name,
                 base_color_factor=tuple(float(value) for value in color),
                 metallic_factor=float(pbr.get("metallicFactor", 1)),
                 roughness_factor=float(pbr.get("roughnessFactor", 1)),
+                emissive_factor=tuple(float(value) for value in emissive_factor),
                 alpha_mode=alpha_mode,
                 double_sided=bool(item.get("doubleSided", False)),
                 color_texture_id=color_texture,
                 data_texture_id=data_texture,
+                normal_texture_id=normal_texture,
+                occlusion_texture_id=occlusion_texture,
+                emissive_texture_id=emissive_texture,
             )
         except (TypeError, ValueError):
             self.errors.append(f"materials[{index}] contains a non-numeric factor")
