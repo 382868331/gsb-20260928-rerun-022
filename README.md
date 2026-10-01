@@ -43,6 +43,35 @@ python3 -m resource3d.cli diff \
   --output build/material-diff.json
 ```
 
+## 贴图分辨率替换
+
+导入后可为共享贴图切换分辨率版本（例如为部分物体选用低分辨率图），材质参数、用途与外观解释保持不变。替换计划是一个 JSON 文件，每项指定源图像（`img_` ID 或图像名）、用途、替换文件，以及可选的节点名单（缺省表示所有引用该贴图的物体）：
+
+```json
+{
+  "replacements": [
+    {"image": "shared", "usage": "color", "file": "shared-low.png", "nodes": ["node-a"]}
+  ]
+}
+```
+
+```bash
+# 预演：列出将切换版本的材质与物体，或报告拒绝原因，不写入任何资源
+python3 -m resource3d.cli retarget --library build/library --asset "$ASSET" --plan plan.json
+# 提交：全部校验通过才原子发布新资产版本，失败不留下半套资源
+python3 -m resource3d.cli retarget --library build/library --asset "$ASSET" --plan plan.json --commit
+# 回退：返回生成该版本的原资产 ID（原版本闭包始终完整可导出）
+python3 -m resource3d.cli rollback --library build/library --asset "$NEW_ASSET"
+```
+
+规则与行为：
+
+- 替换图像必须存在、与原图 MIME 一致，且宽高是原图的整数倍缩小（等比例、不放大），否则按“图像缺失 / 尺寸关系不合法 / 用途不兼容”逐项报告并整体拒绝。
+- 同一图像同时承担颜色与数据等用途时，各用途的替换记录相互独立：只换颜色用途不会影响法线、遮蔽或数据贴图。
+- 只选择部分物体时，被选节点得到新的材质/网格/节点版本，未选对象保持原有内容寻址身份，共享关系不会把它们一起带走。
+- 新图像与贴图仍是内容寻址对象：重复执行同一计划得到同一资产 ID，索引中的 `retargets` 记录只保留一份来源（基资产 + 各项替换），不会产生内容相同但来源不清的资源。
+- 重新导出新资产即可复现各物体的分辨率选择；`rollback` 结合原资产 ID 可回到原图版本。
+
 ## 快速开始
 
 ```bash

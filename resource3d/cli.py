@@ -22,6 +22,15 @@ def main(argv: list[str] | None = None) -> int:
     diff_parser.add_argument("--old-asset", required=True)
     diff_parser.add_argument("--new-asset", required=True)
     diff_parser.add_argument("--output", required=True)
+    retarget_parser = subparsers.add_parser("retarget")
+    retarget_parser.add_argument("--library", required=True)
+    retarget_parser.add_argument("--asset", required=True)
+    retarget_parser.add_argument("--plan", required=True)
+    retarget_parser.add_argument("--commit", action="store_true")
+    retarget_parser.add_argument("--output")
+    rollback_parser = subparsers.add_parser("rollback")
+    rollback_parser.add_argument("--library", required=True)
+    rollback_parser.add_argument("--asset", required=True)
     args = parser.parse_args(argv)
     library = ResourceLibrary(args.library)
     try:
@@ -29,6 +38,20 @@ def main(argv: list[str] | None = None) -> int:
             print(library.import_batch(args.manifest))
         elif args.command == "export":
             print(library.export_inspection(args.asset, args.output))
+        elif args.command == "retarget":
+            if args.commit:
+                _, report = library.apply_retarget(args.asset, args.plan)
+            else:
+                report = library.plan_retarget(args.asset, args.plan)
+            payload = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            if args.output:
+                with open(args.output, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                print(args.output)
+            else:
+                print(payload, end="")
+        elif args.command == "rollback":
+            print(library.retarget_source(args.asset))
         else:
             report = library.compare_assets(args.old_asset, args.new_asset)
             with open(args.output, "w", encoding="utf-8") as handle:

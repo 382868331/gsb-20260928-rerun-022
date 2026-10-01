@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 from .errors import ImportErrorBundle
 from .gltf import GltfImporter
 from .hashing import canonical_json, sha256_bytes
 from .models import Asset, Geometry, Image, Material, Mesh, Node, Scene, Skin, Texture
+from .retarget import image_dimensions
 
 TEXTURE_USAGES = (
     ("color", "color_texture_id"),
@@ -103,6 +105,313 @@ class ResourceLibrary:
             encoding="utf-8",
         )
         return destination
+
+    def plan_retarget(self, asset_id: str, plan_path: Path | str) -> dict[str, object]:
+        report, _ = self._prepare_retarget(asset_id, plan_path)
+        return report
+
+    def apply_retarget(self, asset_id: str, plan_path: Path | str) -> tuple[str, dict[str, object]]:
+        report, prepared = self._prepare_retarget(asset_id, plan_path)
+        if report["errors"]:
+            raise ImportErrorBundle(list(report["errors"]))
+        assert prepared is not None
+        new_asset, new_objects, record = prepared
+        new_asset_id = new_asset.id()
+        existing = self._load_index()
+        merged = {**existing.get("objects", {}), **{key: self._record(value) for key, value in new_objects.items()}}
+        assets = {**existing.get("assets", {}), new_asset_id: record["plan"]}
+        retargets = {**existing.get("retargets", {})}
+        retargets[new_asset_id] = {
+            "base_asset_id": asset_id,
+            "replacements": record["replacements"],
+        }
+        self._commit(new_objects, {"version": 1, "assets": assets, "objects": merged, "retargets": retargets})
+        report["new_asset_id"] = new_asset_id
+        return new_asset_id, report
+
+    def retarget_source(self, asset_id: str) -> str:
+        record = self._load_index().get("retargets", {}).get(asset_id)
+        if not record:
+            raise KeyError(f"{asset_id} is not a retargeted asset")
+        return record["base_asset_id"]
+
+    def _prepare_retarget(
+        self, asset_id: str, plan_path: Path | str
+    ) -> tuple[dict[str, object], tuple[Asset, dict[str, object], dict[str, object]] | None]:
+        plan_path = Path(plan_path)
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ImportErrorBundle([f"{plan_path}: unreadable or invalid JSON: {exc}"]) from exc
+        if not isinstance(plan, dict) or not isinstance(plan.get("replacements"), list):
+            raise ImportErrorBundle([f"{plan_path}: plan must be an object with a replacements list"])
+
+        closure = self._closure(asset_id)
+        images = {oid: obj for oid, obj in closure.items() if isinstance(obj, Image)}
+        textures = {oid: obj for oid, obj in closure.items() if isinstance(obj, Texture)}
+        materials = {oid: obj for oid, obj in closure.items() if isinstance(obj, Material)}
+        meshes = {oid: obj for oid, obj in closure.items() if isinstance(obj, Mesh)}
+        nodes = {oid: obj for oid, obj in closure.items() if isinstance(obj, Node)}
+        scenes = {oid: obj for oid, obj in closure.items() if isinstance(obj, Scene)}
+        base_asset = closure[asset_id]
+        assert isinstance(base_asset, Asset)
+
+        errors: list[str] = []
+        # usage -> list of (source_image_id, new_image, new_texture, target_node_ids)
+        resolved: list[dict[str, object]] = []
+        for position, entry in enumerate(plan["replacements"]):
+            label = f"replacements[{position}]"
+            if not isinstance(entry, dict):
+                errors.append(f"{label}: entry must be an object")
+                continue
+            source_ref = entry.get("image")
+            usage = entry.get("usage")
+            file_name = entry.get("file")
+            source_image_id = None
+            if isinstance(source_ref, str):
+                if source_ref in images:
+                    source_image_id = source_ref
+                else:
+                    matches = [oid for oid, img in images.items() if img.name == source_ref]
+                    if len(matches) == 1:
+                        source_image_id = matches[0]
+            if source_image_id is None:
+                errors.append(f"{label}: 图像缺失: 资产中找不到图像 {source_ref!r}")
+                continue
+            source_image = images[source_image_id]
+            if usage not in dict(TEXTURE_USAGES):
+                errors.append(f"{label}: 用途不兼容: 未知用途 {usage!r}")
+                continue
+            usage_textures = [
+                tex for tex in textures.values()
+                if tex.image_id == source_image_id and tex.usage == usage
+            ]
+            if not usage_textures:
+                errors.append(
+                    f"{label}: 用途不兼容: 图像 {source_ref!r} 在资产中没有 {usage} 用途的贴图"
+                )
+                continue
+            if not isinstance(file_name, str) or not file_name:
+                errors.append(f"{label}: 图像缺失: 未提供替换文件")
+                continue
+            replacement_path = (plan_path.parent / file_name).resolve()
+            try:
+                payload = replacement_path.read_bytes()
+            except OSError:
+                errors.append(f"{label}: 图像缺失: 无法读取 {file_name}")
+                continue
+            suffix = replacement_path.suffix.lower()
+            mime_type = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(suffix, "")
+            if mime_type not in ("image/png", "image/jpeg"):
+                errors.append(f"{label}: 用途不兼容: 不支持的替换图像类型 {suffix!r}")
+                continue
+            if mime_type != source_image.mime_type:
+                errors.append(
+                    f"{label}: 用途不兼容: MIME 从 {source_image.mime_type} 变为 {mime_type}"
+                )
+                continue
+            try:
+                old_width, old_height = image_dimensions(source_image.mime_type, source_image.payload)
+                new_width, new_height = image_dimensions(mime_type, payload)
+            except ValueError as exc:
+                errors.append(f"{label}: 尺寸关系不合法: {exc}")
+                continue
+            if (
+                new_width > old_width
+                or new_height > old_height
+                or old_width * new_height != old_height * new_width
+                or old_width % new_width != 0
+                or old_height % new_height != 0
+            ):
+                errors.append(
+                    f"{label}: 尺寸关系不合法: {new_width}x{new_height} 不是 "
+                    f"{old_width}x{old_height} 的整数倍缩小"
+                )
+                continue
+            node_filter = entry.get("nodes")
+            target_node_ids: set[str] | None = None
+            if node_filter is not None:
+                if not isinstance(node_filter, list):
+                    errors.append(f"{label}: nodes 必须是节点名称列表")
+                    continue
+                target_node_ids = set()
+                for wanted in node_filter:
+                    matches = [oid for oid, node in nodes.items() if node.name == wanted or oid == wanted]
+                    if not matches:
+                        errors.append(f"{label}: 找不到节点 {wanted!r}")
+                    target_node_ids.update(matches)
+            new_image = Image(f"{source_image.name}@{new_width}x{new_height}", mime_type, payload)
+            resolved.append({
+                "label": label,
+                "source_image_id": source_image_id,
+                "usage": usage,
+                "new_image": new_image,
+                "target_node_ids": target_node_ids,
+                "old_size": (old_width, old_height),
+                "new_size": (new_width, new_height),
+            })
+        if errors:
+            return {"asset_id": asset_id, "valid": False, "errors": errors, "changes": []}, None
+
+        # Build replacement textures/materials per usage, keeping each usage
+        # record independent even when usages share one backing image.
+        new_objects: dict[str, object] = {}
+        texture_replacements: dict[str, str] = {}  # old tex id -> new tex id
+        replacement_summaries: list[dict[str, object]] = []
+        for item in resolved:
+            new_image = item["new_image"]
+            assert isinstance(new_image, Image)
+            new_objects[new_image.id()] = new_image
+            for texture in textures.values():
+                if texture.image_id != item["source_image_id"] or texture.usage != item["usage"]:
+                    continue
+                width, height = item["new_size"]
+                new_texture = Texture(f"{texture.name}@{width}x{height}", new_image.id(), texture.usage, texture.tex_coord)
+                new_objects[new_texture.id()] = new_texture
+                texture_replacements[texture.id()] = new_texture.id()
+            replacement_summaries.append({
+                "source_image_id": item["source_image_id"],
+                "usage": item["usage"],
+                "replacement_image_id": new_image.id(),
+                "old_size": list(item["old_size"]),
+                "new_size": list(item["new_size"]),
+                "nodes": sorted(item["target_node_ids"]) if item["target_node_ids"] is not None else None,
+            })
+
+        usage_fields = dict(TEXTURE_USAGES)
+        material_cache: dict[tuple[str, tuple[tuple[str, str], ...]], str] = {}
+
+        def retarget_material(material_id: str, local_textures: dict[str, str]) -> str:
+            key = (material_id, tuple(sorted(local_textures.items())))
+            if key in material_cache:
+                return material_cache[key]
+            material = materials[material_id]
+            updated = material
+            for usage, field_name in TEXTURE_USAGES:
+                texture_id = getattr(material, field_name)
+                if texture_id and texture_id in local_textures:
+                    updated = replace(updated, **{field_name: local_textures[texture_id]})
+            if updated.id() != material_id:
+                new_objects[updated.id()] = updated
+            material_cache[key] = updated.id()
+            return updated.id()
+
+        # A node is affected only when every replacement that touches its
+        # materials either targets it explicitly or has no node filter.
+        def node_selected(node_id: str) -> list[dict[str, object]]:
+            node = nodes[node_id]
+            if not node.mesh_id or node.mesh_id not in meshes:
+                return []
+            mesh = meshes[node.mesh_id]
+            picked = []
+            for item in resolved:
+                for material_id, _, _ in mesh.material_bindings:
+                    material = materials.get(material_id)
+                    if material is None:
+                        continue
+                    texture_id = getattr(material, usage_fields[item["usage"]])
+                    texture = textures.get(texture_id) if texture_id else None
+                    if (
+                        texture is not None
+                        and texture.image_id == item["source_image_id"]
+                        and texture.usage == item["usage"]
+                    ):
+                        if item["target_node_ids"] is None or node_id in item["target_node_ids"]:
+                            picked.append(item)
+                        break
+            return picked
+
+        changes: list[dict[str, object]] = []
+        node_mesh_override: dict[str, str] = {}
+        for node_id, node in nodes.items():
+            picked = node_selected(node_id)
+            if not picked or not node.mesh_id:
+                continue
+            mesh = meshes[node.mesh_id]
+            local_textures: dict[str, str] = {}
+            for item in picked:
+                for old_texture_id, new_texture_id in texture_replacements.items():
+                    old_texture = textures[old_texture_id]
+                    if (
+                        old_texture.image_id == item["source_image_id"]
+                        and old_texture.usage == item["usage"]
+                    ):
+                        local_textures[old_texture_id] = new_texture_id
+            new_bindings = tuple(
+                (retarget_material(material_id, local_textures), offset, count)
+                for material_id, offset, count in mesh.material_bindings
+            )
+            if new_bindings == mesh.material_bindings:
+                continue
+            new_mesh = Mesh(mesh.name, mesh.geometry_id, new_bindings)
+            new_objects[new_mesh.id()] = new_mesh
+            node_mesh_override[node_id] = new_mesh.id()
+            for (material_id, _, _), (new_material_id, _, _) in zip(mesh.material_bindings, new_bindings):
+                if new_material_id == material_id:
+                    continue
+                material = materials[material_id]
+                for usage, field_name in TEXTURE_USAGES:
+                    old_tex = getattr(material, field_name)
+                    if old_tex and old_tex in local_textures:
+                        new_material = new_objects[new_material_id]
+                        assert isinstance(new_material, Material)
+                        changes.append({
+                            "node_id": node_id,
+                            "node_name": node.name,
+                            "mesh_id": node.mesh_id,
+                            "new_mesh_id": new_mesh.id(),
+                            "material_name": material.name,
+                            "old_material_id": material_id,
+                            "new_material_id": new_material.id(),
+                            "usage": usage,
+                            "old_texture_id": old_tex,
+                            "new_texture_id": getattr(new_material, field_name),
+                            "old_image_id": textures[old_tex].image_id,
+                            "new_image_id": new_objects[local_textures[old_tex]].image_id,  # type: ignore[attr-defined]
+                        })
+
+        # Rebuild the node hierarchy bottom-up; untouched subtrees keep their
+        # original content-addressed ids so unselected objects stay shared.
+        rebuilt_nodes: dict[str, str] = {}
+
+        def rebuild_node(node_id: str) -> str:
+            if node_id in rebuilt_nodes:
+                return rebuilt_nodes[node_id]
+            node = nodes[node_id]
+            new_children = tuple(rebuild_node(child) for child in node.children if child in nodes)
+            new_mesh_id = node_mesh_override.get(node_id, node.mesh_id)
+            if new_children == node.children and new_mesh_id == node.mesh_id:
+                rebuilt_nodes[node_id] = node_id
+                return node_id
+            new_node = Node(node.name, node.transform, new_mesh_id, new_children, node.skin_id)
+            new_objects[new_node.id()] = new_node
+            rebuilt_nodes[node_id] = new_node.id()
+            return new_node.id()
+
+        scene_replacements: dict[str, str] = {}
+        for scene_id, scene in scenes.items():
+            new_roots = tuple(rebuild_node(root) for root in scene.root_node_ids if root in nodes)
+            if new_roots != scene.root_node_ids:
+                new_scene = Scene(scene.name, new_roots)
+                new_objects[new_scene.id()] = new_scene
+                scene_replacements[scene_id] = new_scene.id()
+
+        new_scene_ids = tuple(scene_replacements.get(sid, sid) for sid in base_asset.scene_ids)
+        new_asset = Asset(base_asset.source_format, new_scene_ids)
+        new_objects[new_asset.id()] = new_asset
+
+        record = {
+            "plan": f"retarget:{Path(plan_path).name}",
+            "replacements": replacement_summaries,
+        }
+        report = {
+            "asset_id": asset_id,
+            "valid": True,
+            "errors": [],
+            "changes": sorted(changes, key=lambda item: (item["node_id"], item["usage"])),
+            "new_asset_id": new_asset.id(),
+        }
+        return report, (new_asset, new_objects, record)
 
     def _closure(self, asset_id: str) -> dict[str, object]:
         asset = self.load_object(asset_id)
@@ -361,6 +670,6 @@ class ResourceLibrary:
         if not self.index_path.exists():
             return {"version": 1, "assets": {}, "objects": {}}
         data = json.loads(self.index_path.read_text(encoding="utf-8"))
-        if set(data) != {"version", "assets", "objects"}:
+        if not {"version", "assets", "objects"} <= set(data) <= {"version", "assets", "objects", "retargets"}:
             raise ValueError("invalid library index")
         return data
