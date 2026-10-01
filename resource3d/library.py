@@ -8,7 +8,19 @@ from pathlib import Path
 from .errors import ImportErrorBundle
 from .gltf import GltfImporter
 from .hashing import canonical_json, sha256_bytes
-from .models import Asset, Geometry, Image, Material, Mesh, Node, Scene, Skin, Texture
+from .models import (
+    Asset,
+    Geometry,
+    Image,
+    Material,
+    Mesh,
+    Node,
+    RetargetRecord,
+    Scene,
+    Skin,
+    Texture,
+)
+from .retarget import RetargetPlanner
 
 TEXTURE_USAGES = (
     ("color", "color_texture_id"),
@@ -33,6 +45,22 @@ class ResourceLibrary:
         assets = {**existing.get("assets", {}), asset.id(): manifest.name}
         self._commit(objects, {"version": 1, "assets": assets, "objects": merged})
         return asset.id()
+
+    def plan_retarget(self, asset_id: str, spec: dict, spec_dir: Path | str) -> dict:
+        return RetargetPlanner(self, asset_id, spec, Path(spec_dir)).plan()
+
+    def apply_retarget(self, asset_id: str, spec: dict, spec_dir: Path | str) -> str:
+        return RetargetPlanner(self, asset_id, spec, Path(spec_dir)).apply()
+
+    def rollback_asset(self, asset_id: str) -> str:
+        asset = self.load_object(asset_id)
+        if not isinstance(asset, Asset):
+            raise KeyError(asset_id)
+        if asset.retarget_record_id is None:
+            return asset_id
+        record = self.load_object(asset.retarget_record_id)
+        assert isinstance(record, RetargetRecord)
+        return record.base_asset_id
 
     def load_object(self, object_id: str):
         record = self._load_index()["objects"][object_id]
@@ -91,7 +119,12 @@ class ResourceLibrary:
         if kind == "scn":
             return Scene(data["name"], tuple(data["root_node_ids"]))
         if kind == "ast":
-            return Asset(data["source_format"], tuple(data["scene_ids"]))
+            return Asset(data["source_format"], tuple(data["scene_ids"]), data.get("retarget_record_id"))
+        if kind == "ret":
+            return RetargetRecord(
+                data["base_asset_id"],
+                tuple(dict(entry) for entry in data["entries"]),
+            )
         raise KeyError(object_id)
 
     def export_inspection(self, asset_id: str, destination: Path | str) -> Path:
@@ -141,6 +174,8 @@ class ResourceLibrary:
             elif isinstance(obj, Asset):
                 for scene_id in obj.scene_ids:
                     visit(scene_id)
+                if obj.retarget_record_id:
+                    visit(obj.retarget_record_id)
 
         visit(asset_id)
         return collected

@@ -43,6 +43,42 @@ python3 -m resource3d.cli diff \
   --output build/material-diff.json
 ```
 
+## 贴图分辨率替换
+
+导入后可以为部分物体把共享贴图换成低分辨率版本，材质的用途与外观解释（sRGB/线性、法线缩放、遮蔽强度等）保持不变。替换规格是一个 JSON 文件，替换文件路径相对规格文件所在目录解析，且不允许逃逸该目录：
+
+```json
+{
+  "replacements": [
+    {
+      "image": "atlas",
+      "file": "atlas_1k.png",
+      "usages": ["color", "normal", "occlusion"],
+      "objects": ["obj-a"]
+    }
+  ]
+}
+```
+
+- `image`：资产内图像名；`file`：低分辨率替换文件（PNG/JPEG，须与原图同 MIME）。
+- `usages`：可选，限定替换的用途；缺省时替换该图像在被选物体上的全部用途。同一图像同时作颜色和数据用途时，各用途的采用记录互相独立。
+- `objects`：按节点名选择要切换的物体；未选中的物体继续引用原图，共享材质不会被一起带走。
+
+```bash
+# 预演：列出将切换版本的材质/物体，以及图像缺失、尺寸关系不合法、用途不兼容等原因
+python3 -m resource3d.cli retarget \
+  --library build/library --asset "$ASSET" --spec retarget.json --dry-run
+
+# 应用：校验全部通过才发布新资产版本，失败不写入任何对象
+python3 -m resource3d.cli retarget \
+  --library build/library --asset "$ASSET" --spec retarget.json
+
+# 回退：解析出版本所基于的原始资产 id
+python3 -m resource3d.cli rollback --library build/library --asset "$NEW_ASSET"
+```
+
+替换文件必须小于原图、保持宽高比且为整数倍缩放，否则与缺失图像、未知物体、用途不兼容一样计入预演错误。应用后生成 `ret_` 采用记录（内容寻址，含原资产 id、每个物体/材质/用途的新旧贴图与图像、替换文件摘要），新资产通过 `retarget_record_id` 引用它；重复执行同一替换只会复用既有对象并返回同一资产 id。导出闭包包含采用记录，因此保存并重新导出即可复现各物体的选择，原始资产版本保持字节稳定、随时可回退。
+
 ## 快速开始
 
 ```bash

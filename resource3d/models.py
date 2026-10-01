@@ -180,9 +180,28 @@ class Scene:
 class Asset:
     source_format: str
     scene_ids: tuple[str, ...]
+    retarget_record_id: str | None = None
 
     def id(self) -> str:
         return content_id("ast", self.data())
 
     def data(self) -> dict[str, Any]:
-        return {"source_format": self.source_format, "scene_ids": list(self.scene_ids)}
+        data: dict[str, Any] = {"source_format": self.source_format, "scene_ids": list(self.scene_ids)}
+        if self.retarget_record_id is not None:
+            data["retarget_record_id"] = self.retarget_record_id
+        return data
+
+
+@dataclass(frozen=True)
+class RetargetRecord:
+    base_asset_id: str
+    entries: tuple[dict[str, Any], ...]
+
+    def id(self) -> str:
+        return content_id("ret", self.data())
+
+    def data(self) -> dict[str, Any]:
+        return {
+            "base_asset_id": self.base_asset_id,
+            "entries": [dict(entry) for entry in self.entries],
+        }
