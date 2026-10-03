@@ -54,17 +54,28 @@ class Texture:
     image_id: str
     usage: Literal["color", "data", "normal", "occlusion", "emissive"]
     tex_coord: int = 0
+    tile_position: tuple[int, int] | None = None
+    tile_layout: tuple[int, int] | None = None
+    tile_edges: tuple[tuple[str, ...], ...] | None = None
 
     def id(self) -> str:
         return content_id("tex", self.data())
 
     def data(self) -> dict[str, Any]:
-        return {
+        data = {
             "name": self.name,
             "image_id": self.image_id,
             "usage": self.usage,
             "tex_coord": self.tex_coord,
         }
+        if self.tile_position is not None and self.tile_layout is not None:
+            data["tile"] = {
+                "position": list(self.tile_position),
+                "layout": list(self.tile_layout),
+            }
+            if self.tile_edges is not None:
+                data["tile"]["edges"] = [list(edge) for edge in self.tile_edges]
+        return data
 
 
 @dataclass(frozen=True)
@@ -83,6 +94,7 @@ class Material:
     emissive_factor: tuple[float, float, float] = (0.0, 0.0, 0.0)
     normal_scale: float = 1.0
     occlusion_strength: float = 1.0
+    tile_textures: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def id(self) -> str:
         return content_id("mat", self.data())
@@ -103,6 +115,10 @@ class Material:
             "emissive_factor": list(self.emissive_factor),
             "normal_scale": self.normal_scale,
             "occlusion_strength": self.occlusion_strength,
+            "tile_textures": [
+                {"usage": usage, "texture_ids": list(texture_ids)}
+                for usage, texture_ids in self.tile_textures
+            ],
         }
 
 

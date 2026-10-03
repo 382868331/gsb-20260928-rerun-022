@@ -6,7 +6,7 @@
 
 - glTF 2.0 `.gltf`，内嵌 `data:application/octet-stream;base64` 或同批相对外部 buffer。
 - 三角形图元；`POSITION`、可选 `NORMAL`、标量索引；非索引图元会按连续三点转换。
-- PBR `pbrMetallicRoughness` 材质因子、`alphaMode`、`doubleSided`、`emissiveFactor`，以及 `baseColorTexture`（颜色用途，sRGB 内容）、`metallicRoughnessTexture`（数据用途，线性内容）、`normalTexture`（含 `scale`）、`occlusionTexture`（含 `strength`）与 `emissiveTexture`。
+- PBR `pbrMetallicRoughness` 材质因子、`alphaMode`、`doubleSided`、`emissiveFactor`，以及 `baseColorTexture`（颜色用途，sRGB 内容）、`metallicRoughnessTexture`（数据用途，线性内容）、`normalTexture`（含 `scale`）、`occlusionTexture`（含 `strength`）与 `emissiveTexture`；贴图支持单图或按用途组织的多张分片（见“分片贴图的选择性版本替换”）。
 - 贴图来源支持外部相对文件、内嵌 `data:` 与 `bufferView`（PNG/JPEG）。同一图像被多个材质或多种用途引用时共享同一 `img_` 身份；颜色、数据、法线、遮蔽、自发光用途分别生成独立的 `tex_` 身份，数据贴图不会被当成颜色处理。
 - 蒙皮网格：`JOINTS_0`/`WEIGHTS_0`（VEC4，整数关节、浮点权重）、`skins[].joints`、可选 `skeleton` 与列主序 `inverseBindMatrices`（MAT4）。
 - 节点 TRS 或 16 元素矩阵、嵌套层级和多图元材质区间；蒙皮节点通过 `skin` 引用皮肤对象。
@@ -71,6 +71,43 @@ python3 -m resource3d.cli rollback --library build/library --asset "$NEW_ASSET"
 - 只选择部分物体时，被选节点得到新的材质/网格/节点版本，未选对象保持原有内容寻址身份，共享关系不会把它们一起带走。
 - 新图像与贴图仍是内容寻址对象：重复执行同一计划得到同一资产 ID，索引中的 `retargets` 记录只保留一份来源（基资产 + 各项替换），不会产生内容相同但来源不清的资源。
 - 重新导出新资产即可复现各物体的分辨率选择；`rollback` 结合原资产 ID 可回到原图版本。
+
+## 分片贴图的选择性版本替换
+
+同一种共享材质的每个贴图用途可以由多张**分片**组成（例如 2x2 拼接的颜色贴图）。分片身份是 `图像 + 用途 + 分片位置 + 布局 + 边缘标签`：
+
+- `img_` 仍只按字节内容去重；同一张图被不同位置或颜色/法线等不同用途引用时只导入一次。
+- 每个位置、每个用途生成各自独立的 `tex_` 身份。内容相同也不会交换位置或用途解释：颜色片不会被当作法线片。
+- `Material` 的 `tile_textures` 按用途保存有序的分片槽；单图用途仍使用原来的单张贴图字段。
+
+分片布局通过 glTF 的 `extras` 描述：`textures[i].extras.tile` 给出 `position`（列、行）、`layout`（列数、行数）与可选 `edges`（左/右/上/下四组接缝标签），`materials[i].extras.tiles` 按用途列出分片（`index`、可选 `texCoord/extras`）。导入时校验位置不重复、覆盖完整布局、`texCoord` 一致，以及相邻分片接缝处的边缘标签一致；缺片的导入直接失败，不会用空白图补齐。
+
+分片版本更新计划与分辨率替换共用 `retarget` 命令，计划顶层含 `tiles` 时走分片流程：
+
+```json
+{
+  "tiles": [
+    {"material": "tiled-mat", "usage": "color", "position": [0, 0], "file": "color-0-0-low.png"},
+    {"material": "tiled-mat", "usage": "normal", "position": [1, 0], "file": "normal-1-0-low.png",
+     "edges": [[], ["seam"], [], []]}
+  ],
+  "nodes": ["node-a"],
+  "exclude_nodes": []
+}
+```
+
+- 一次更新可以只给部分分片；颜色、法线、遮蔽等用途的完整程度可以不同。未列出的分片在报告的 `kept_tiles` 中显式列出并继续沿用旧来源，绝不会被解释成空白覆盖。
+- `nodes` 缺省表示所有受影响物体；只列部分节点时，仅被选对象生成新的材质/网格/节点版本，未选对象保持原内容寻址身份，共享材质不会把它们一并切换。`exclude_nodes` 可显式标记暂不接受更新的区域。
+- 预演报告 `updates` 给出每项的用途、位置、旧/新分辨率、MIME、自身边缘标签与邻片接缝标签，以及每个材质变体的新 `img_`/`tex_` 身份；`regions` 列出受影响的物体、网格、材质和面区间（`face_offset/face_count`）。先预演确认跨分片边界外观与缺失区域，再 `--commit`。
+- 校验包括：材质/用途/分片位置存在、文件可读、MIME 不变、新尺寸是旧尺寸的等比例整数倍缩小、同一 `(材质, 用途)` 批次比例一致、`edges`（如提供）与原片一致、节点可解析。任一失败都整体拒绝，保留已有材质与未发布选择，不写入半成品资源。
+- 发布资产的 `tile_versions` 记录形成可完整重现的材质版本：根资产、采用节点、每个更新分片在各材质变体上的旧 `tex_/img_` 来源、继续沿用的分片清单。重复同一计划得到同一资产 ID；同内容文件只产生一个 `img_`，但每个位置/用途保留各自采用身份。
+- 撤回某对象的采用使用 `{"revert": ["node-a"]}` 计划：被列节点回到根资产的材质组合，其他节点保持现状；溯源链始终指向最初导入的根资产，重新导出再导入即可追到当时各片来源。
+
+```bash
+python3 scripts/create_tiled_sample.py samples/tiled
+python3 -m resource3d.cli retarget --library build/library --asset "$ASSET" --plan samples/tiled/tile-plan.json
+python3 -m resource3d.cli retarget --library build/library --asset "$ASSET" --plan samples/tiled/tile-plan.json --commit
+```
 
 ## 快速开始
 

@@ -206,10 +206,44 @@ class GltfImporter:
             image = self.images[image_index]
             if not image.payload:
                 raise ValueError(f"references broken images[{image_index}]")
-            return Texture(name, image.id(), "color")
+            tile = self._tile_spec(item.get("extras"), name)
+            return Texture(
+                name,
+                image.id(),
+                "color",
+                tile_position=tile[0],
+                tile_layout=tile[1],
+                tile_edges=tile[2],
+            )
         except (KeyError, TypeError, ValueError, IndexError) as exc:
             self.errors.append(f"textures[{index}]: {exc}")
             return fallback
+
+    def _tile_spec(
+        self, extras: object, label: str
+    ) -> tuple[tuple[int, int] | None, tuple[int, int] | None, tuple[tuple[str, ...], ...] | None]:
+        if not isinstance(extras, dict) or not isinstance(extras.get("tile"), dict):
+            return None, None, None
+        tile = extras["tile"]
+        position_raw = tile.get("position")
+        layout_raw = tile.get("layout")
+        if not isinstance(position_raw, list) or len(position_raw) != 2:
+            raise ValueError(f"{label} tile position must be [column, row]")
+        if not isinstance(layout_raw, list) or len(layout_raw) != 2:
+            raise ValueError(f"{label} tile layout must be [columns, rows]")
+        column, row = int(position_raw[0]), int(position_raw[1])
+        columns, rows = int(layout_raw[0]), int(layout_raw[1])
+        if columns <= 0 or rows <= 0 or not (0 <= column < columns) or not (0 <= row < rows):
+            raise ValueError(f"{label} tile position {column},{row} outside layout {columns}x{rows}")
+        edges_raw = tile.get("edges")
+        edges: tuple[tuple[str, ...], ...] | None = None
+        if edges_raw is not None:
+            if not isinstance(edges_raw, list) or len(edges_raw) != 4 or not all(
+                isinstance(side, list) and all(isinstance(tag, str) for tag in side) for side in edges_raw
+            ):
+                raise ValueError(f"{label} tile edges must be four lists of edge tags (left, right, top, bottom)")
+            edges = tuple(tuple(side) for side in edges_raw)
+        return (column, row), (columns, rows), edges
 
     def _texture_binding(self, container: dict, key: str, material_index: int, usage: str) -> str | None:
         raw = container.get(key)
@@ -225,12 +259,100 @@ class GltfImporter:
             tex_coord = int(raw.get("texCoord", 0))
             if tex_coord < 0:
                 raise ValueError("texCoord must be non-negative")
-            bound = Texture(base.name, base.image_id, usage, tex_coord)  # type: ignore[arg-type]
+            bound = Texture(
+                base.name,
+                base.image_id,
+                usage,  # type: ignore[arg-type]
+                tex_coord,
+                base.tile_position,
+                base.tile_layout,
+                base.tile_edges,
+            )
             self.bound_textures[bound.id()] = bound
             return bound.id()
         except (KeyError, TypeError, ValueError, IndexError) as exc:
             self.errors.append(f"materials[{material_index}].{key}: {exc}")
             return None
+
+    def _tile_texture_slots(self, material_index: int, item: dict) -> dict[str, tuple[str, ...]]:
+        extras = item.get("extras")
+        if not isinstance(extras, dict) or not isinstance(extras.get("tiles"), dict):
+            return {}
+        slots: dict[str, tuple[str, ...]] = {}
+        valid_usages = {"color", "data", "normal", "occlusion", "emissive"}
+        for usage, entries in extras["tiles"].items():
+            if usage not in valid_usages:
+                self.errors.append(f"materials[{material_index}].extras.tiles: unknown usage {usage!r}")
+                continue
+            if not isinstance(entries, list) or not entries:
+                self.errors.append(f"materials[{material_index}].extras.tiles.{usage} must be a non-empty list")
+                continue
+            bound_ids: list[str] = []
+            specs: list[tuple[tuple[int, int], tuple[int, int], tuple[tuple[str, ...], ...] | None, str]] = []
+            tex_coord: int | None = None
+            for slot, entry in enumerate(entries):
+                label = f"materials[{material_index}].extras.tiles.{usage}[{slot}]"
+                try:
+                    if not isinstance(entry, dict):
+                        raise TypeError("tile entry must be an object")
+                    texture_index = int(entry["index"])
+                    base = self.textures[texture_index]
+                    if not base.image_id:
+                        raise ValueError(f"references broken textures[{texture_index}]")
+                    slot_coord = int(entry.get("texCoord", base.tex_coord))
+                    if slot_coord < 0:
+                        raise ValueError("texCoord must be non-negative")
+                    if tex_coord is None:
+                        tex_coord = slot_coord
+                    elif slot_coord != tex_coord:
+                        raise ValueError("all tiles of one usage must share texCoord")
+                    tile = self._tile_spec(entry.get("extras"), label)
+                    position = tile[0] or base.tile_position
+                    layout = tile[1] or base.tile_layout
+                    edges = tile[2] if tile[2] is not None else base.tile_edges
+                    if position is None or layout is None:
+                        raise ValueError("tile needs position and layout")
+                    bound = Texture(base.name, base.image_id, usage, slot_coord, position, layout, edges)  # type: ignore[arg-type]
+                    self.bound_textures[bound.id()] = bound
+                    bound_ids.append(bound.id())
+                    specs.append((position, layout, edges, label))
+                except (KeyError, TypeError, ValueError, IndexError) as exc:
+                    self.errors.append(str(exc))
+            if not specs:
+                continue
+            layout = specs[0][1]
+            positions = {spec[0] for spec in specs}
+            if any(spec[1] != layout for spec in specs):
+                self.errors.append(f"materials[{material_index}].extras.tiles.{usage}: tiles disagree on layout")
+            if len(positions) != len(specs):
+                self.errors.append(f"materials[{material_index}].extras.tiles.{usage}: duplicate tile positions")
+            columns, rows = layout
+            expected = {(column, row) for column in range(columns) for row in range(rows)}
+            if positions != expected:
+                missing = sorted(expected - positions)
+                self.errors.append(
+                    f"materials[{material_index}].extras.tiles.{usage}: incomplete tile set, missing {missing}"
+                )
+            by_position = {spec[0]: spec for spec in specs}
+            for (column, row), _layout, edges, label in specs:
+                if edges is None:
+                    continue
+                for side_a, side_b, dcolumn, drow in (
+                    (1, 0, 1, 0),
+                    (3, 2, 0, 1),
+                ):
+                    neighbor_pos = (column + dcolumn, row + drow)
+                    if neighbor_pos not in positions:
+                        continue
+                    neighbor_edges = by_position[neighbor_pos][2]
+                    if neighbor_edges is None:
+                        continue
+                    if tuple(edges[side_a]) != tuple(neighbor_edges[side_b]):
+                        self.errors.append(
+                            f"{label}: edge tags do not match tile {neighbor_pos[0]},{neighbor_pos[1]} across the shared seam"
+                        )
+            slots[usage] = tuple(bound_ids)
+        return slots
 
     def _read_accessor(self, index: int, expected_type: str) -> list[tuple[float, ...]]:
         try:
@@ -295,6 +417,9 @@ class GltfImporter:
             texture_ids["normal"] = self._texture_binding(item, "normalTexture", index, "normal")
             texture_ids["occlusion"] = self._texture_binding(item, "occlusionTexture", index, "occlusion")
             texture_ids["emissive"] = self._texture_binding(item, "emissiveTexture", index, "emissive")
+        tile_slots = self._tile_texture_slots(index, item)
+        for usage in tile_slots:
+            texture_ids[usage] = None
         emissive_factor = item.get("emissiveFactor", [0.0, 0.0, 0.0])
         if not isinstance(emissive_factor, list) or len(emissive_factor) != 3:
             self.errors.append(f"materials[{index}] has invalid emissiveFactor")
@@ -315,6 +440,7 @@ class GltfImporter:
                 emissive_factor=tuple(float(value) for value in emissive_factor),
                 normal_scale=self._texture_scale(item, "normalTexture", "scale", index, 1.0),
                 occlusion_strength=self._texture_scale(item, "occlusionTexture", "strength", index, 1.0),
+                tile_textures=tuple(sorted(tile_slots.items())),
             )
         except (TypeError, ValueError):
             self.errors.append(f"materials[{index}] contains a non-numeric factor")

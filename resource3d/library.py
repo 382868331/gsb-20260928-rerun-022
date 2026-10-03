@@ -52,7 +52,14 @@ class ResourceLibrary:
         if kind == "img":
             return Image(data["name"], data["mime_type"], bytes.fromhex(data["payload"]))
         if kind == "tex":
-            return Texture(data["name"], data["image_id"], data["usage"], data.get("tex_coord", 0))
+            tile = data.get("tile")
+            position = tuple(tile["position"]) if tile else None
+            layout = tuple(tile["layout"]) if tile else None
+            edges = tuple(tuple(edge) for edge in tile["edges"]) if tile and tile.get("edges") else None
+            return Texture(
+                data["name"], data["image_id"], data["usage"], data.get("tex_coord", 0),
+                position, layout, edges,
+            )
         if kind == "mat":
             return Material(
                 data["name"],
@@ -69,6 +76,10 @@ class ResourceLibrary:
                 tuple(data.get("emissive_factor", (0.0, 0.0, 0.0))),
                 data.get("normal_scale", 1.0),
                 data.get("occlusion_strength", 1.0),
+                tuple(
+                    (entry["usage"], tuple(entry["texture_ids"]))
+                    for entry in data.get("tile_textures", [])
+                ),
             )
         if kind == "msh":
             return Mesh(
@@ -107,10 +118,14 @@ class ResourceLibrary:
         return destination
 
     def plan_retarget(self, asset_id: str, plan_path: Path | str) -> dict[str, object]:
+        if self._plan_kind(plan_path) == "tiles":
+            return self._tile_report(asset_id, plan_path)
         report, _ = self._prepare_retarget(asset_id, plan_path)
         return report
 
     def apply_retarget(self, asset_id: str, plan_path: Path | str) -> tuple[str, dict[str, object]]:
+        if self._plan_kind(plan_path) == "tiles":
+            return self._apply_tile_version(asset_id, plan_path)
         report, prepared = self._prepare_retarget(asset_id, plan_path)
         if report["errors"]:
             raise ImportErrorBundle(list(report["errors"]))
@@ -130,10 +145,649 @@ class ResourceLibrary:
         return new_asset_id, report
 
     def retarget_source(self, asset_id: str) -> str:
-        record = self._load_index().get("retargets", {}).get(asset_id)
+        index = self._load_index()
+        record = index.get("retargets", {}).get(asset_id) or index.get("tile_versions", {}).get(asset_id)
         if not record:
             raise KeyError(f"{asset_id} is not a retargeted asset")
         return record["base_asset_id"]
+
+    # ------------------------------------------------------------------
+    # Tiled texture versions
+    # ------------------------------------------------------------------
+
+    def _tile_report(self, asset_id: str, plan_path: Path | str) -> dict[str, object]:
+        report, _ = self._prepare_tile_version(asset_id, plan_path)
+        return report
+
+    def _apply_tile_version(self, asset_id: str, plan_path: Path | str) -> tuple[str, dict[str, object]]:
+        report, prepared = self._prepare_tile_version(asset_id, plan_path)
+        if report["errors"]:
+            raise ImportErrorBundle(list(report["errors"]))
+        assert prepared is not None
+        new_asset, new_objects, record = prepared
+        new_asset_id = new_asset.id()
+        existing = self._load_index()
+        merged = {**existing.get("objects", {}), **{key: self._record(value) for key, value in new_objects.items()}}
+        assets = {**existing.get("assets", {}), new_asset_id: record["plan"]}
+        tile_versions = {**existing.get("tile_versions", {})}
+        tile_versions[new_asset_id] = record["provenance"]
+        self._commit(
+            new_objects,
+            {
+                "version": 1,
+                "assets": assets,
+                "objects": merged,
+                "tile_versions": tile_versions,
+                **({"retargets": existing["retargets"]} if "retargets" in existing else {}),
+            },
+        )
+        report["new_asset_id"] = new_asset_id
+        return new_asset_id, report
+
+    def _prepare_tile_version(
+        self, asset_id: str, plan_path: Path | str
+    ) -> tuple[dict[str, object], tuple[Asset, dict[str, object], dict[str, object]] | None]:
+        plan_path = Path(plan_path)
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ImportErrorBundle([f"{plan_path}: unreadable or invalid JSON: {exc}"]) from exc
+
+        closure = self._closure(asset_id)
+        images = {oid: obj for oid, obj in closure.items() if isinstance(obj, Image)}
+        textures = {oid: obj for oid, obj in closure.items() if isinstance(obj, Texture)}
+        materials = {oid: obj for oid, obj in closure.items() if isinstance(obj, Material)}
+        meshes = {oid: obj for oid, obj in closure.items() if isinstance(obj, Mesh)}
+        nodes = {oid: obj for oid, obj in closure.items() if isinstance(obj, Node)}
+        scenes = {oid: obj for oid, obj in closure.items() if isinstance(obj, Scene)}
+        base_asset = closure[asset_id]
+        assert isinstance(base_asset, Asset)
+
+        errors: list[str] = []
+        revert_targets = plan.get("revert")
+        if revert_targets is not None and ("tiles" in plan or "nodes" in plan):
+            errors.append("revert cannot be combined with tile updates")
+        if revert_targets is not None:
+            if not isinstance(revert_targets, list) or not all(isinstance(item, str) for item in revert_targets):
+                errors.append("revert must be a list of node names or node ids")
+                revert_targets = []
+            index = self._load_index()
+            root_asset_id = self._tile_base_chain(asset_id, index.get("tile_versions", {}), errors)
+            if errors:
+                return self._invalid_tile_report(asset_id, errors), None
+            requested_nodes = self._resolve_node_names(nodes, revert_targets, "revert", errors)
+            if errors:
+                return self._invalid_tile_report(asset_id, errors), None
+            return self._build_tile_version(
+                asset_id=asset_id,
+                closure=closure,
+                root_asset_id=root_asset_id,
+                parsed=[],
+                textures=textures,
+                images=images,
+                materials=materials,
+                meshes=meshes,
+                nodes=nodes,
+                scenes=scenes,
+                base_asset=base_asset,
+                plan_path=plan_path,
+                revert_nodes=requested_nodes,
+            )
+
+        tile_entries = plan.get("tiles", [])
+        if not isinstance(tile_entries, list):
+            errors.append("tiles must be a list")
+            tile_entries = []
+
+        # Material version currently used at each node (this asset may already
+        # be a tiled version with per-node material variants).
+        node_material: dict[str, set[str]] = {}
+        for node_id, node in nodes.items():
+            if node.mesh_id and node.mesh_id in meshes:
+                node_material[node_id] = {
+                    material_id for material_id, _, _ in meshes[node.mesh_id].material_bindings
+                }
+        named_materials: dict[str, set[str]] = {}
+        for material_id, material in materials.items():
+            named_materials.setdefault(material.name, set()).add(material_id)
+
+        # Tile layout per material name / usage, taken from any tiled variant.
+        layouts: dict[tuple[str, str], tuple[int, int]] = {}
+        for material in materials.values():
+            for usage, texture_ids in material.tile_textures:
+                tile_texture = textures[texture_ids[0]]
+                assert tile_texture.tile_layout is not None
+                layouts[(material.name, usage)] = tile_texture.tile_layout
+
+        parsed: list[dict[str, object]] = []
+        seen_keys: set[tuple[str, str, tuple[int, int]]] = set()
+        for position_index, entry in enumerate(tile_entries):
+            label = f"tiles[{position_index}]"
+            if not isinstance(entry, dict):
+                errors.append(f"{label}: entry must be an object")
+                continue
+            material_name = entry.get("material")
+            usage = entry.get("usage")
+            pos_raw = entry.get("position")
+            file_name = entry.get("file")
+            if not isinstance(material_name, str) or material_name not in named_materials:
+                errors.append(f"{label}: 材质缺失: 找不到分片材质 {material_name!r}")
+                continue
+            if usage not in dict(TEXTURE_USAGES):
+                errors.append(f"{label}: 用途不兼容: 未知用途 {usage!r}")
+                continue
+            layout = layouts.get((material_name, usage))
+            if layout is None:
+                errors.append(f"{label}: 用途不兼容: 材质 {material_name!r} 的 {usage} 用途没有分片布局")
+                continue
+            try:
+                if not isinstance(pos_raw, list) or len(pos_raw) != 2:
+                    raise ValueError
+                column, row = int(pos_raw[0]), int(pos_raw[1])
+            except (TypeError, ValueError):
+                errors.append(f"{label}: 分片位置不合法: position 必须是 [column, row]")
+                continue
+            if not (0 <= column < layout[0] and 0 <= row < layout[1]):
+                errors.append(
+                    f"{label}: 分片位置不合法: {column},{row} 超出 {layout[0]}x{layout[1]} 布局"
+                )
+                continue
+            key = (material_name, usage, (column, row))
+            if key in seen_keys:
+                errors.append(f"{label}: 同一分片 {material_name!r}/{usage}/{column},{row} 被重复更新")
+                continue
+            seen_keys.add(key)
+            if not isinstance(file_name, str) or not file_name:
+                errors.append(f"{label}: 图像缺失: 未提供分片文件")
+                continue
+            replacement_path = (plan_path.parent / file_name).resolve()
+            try:
+                payload = replacement_path.read_bytes()
+            except OSError:
+                errors.append(f"{label}: 图像缺失: 无法读取 {file_name}")
+                continue
+            suffix = replacement_path.suffix.lower()
+            mime_type = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(suffix, "")
+            if mime_type not in ("image/png", "image/jpeg"):
+                errors.append(f"{label}: 用途不兼容: 不支持的图像类型 {suffix!r}")
+                continue
+            # The new tile replaces the currently used tile in every material
+            # variant (per-node versions can already differ). Each variant
+            # keeps its own old/new source identity.
+            variant_sources: dict[str, dict[str, object]] = {}
+            entry_errors: list[str] = []
+            for material_id in named_materials[material_name]:
+                material = materials[material_id]
+                slots = dict(material.tile_textures)
+                if usage not in slots:
+                    continue
+                tile_id = self._tile_at(slots[usage], textures, column, row)
+                if tile_id is None:
+                    entry_errors.append(f"{label}: 分片位置不合法: 材质版本缺少 {column},{row} 分片")
+                    continue
+                tile = textures[tile_id]
+                old_image = images.get(tile.image_id)
+                if old_image is None:
+                    entry_errors.append(f"{label}: 图像缺失: 找不到当前分片图像")
+                    continue
+                if mime_type != old_image.mime_type:
+                    entry_errors.append(
+                        f"{label}: 用途不兼容: MIME 从 {old_image.mime_type} 变为 {mime_type}"
+                    )
+                    continue
+                try:
+                    old_width, old_height = image_dimensions(old_image.mime_type, old_image.payload)
+                    new_width, new_height = image_dimensions(mime_type, payload)
+                except ValueError as exc:
+                    entry_errors.append(f"{label}: 尺寸关系不合法: {exc}")
+                    continue
+                variant_sources[material_id] = {
+                    "old_texture_id": tile_id,
+                    "old_image_id": old_image.id(),
+                    "old_size": (old_width, old_height),
+                    "new_size": (new_width, new_height),
+                    "edges": tile.tile_edges,
+                }
+            if entry_errors:
+                errors.extend(dict.fromkeys(entry_errors))
+                continue
+            supplied_edges = entry.get("edges")
+            supplied: tuple[tuple[str, ...], ...] | None = None
+            if supplied_edges is not None:
+                if not isinstance(supplied_edges, list) or len(supplied_edges) != 4 or not all(
+                    isinstance(side, list) and all(isinstance(tag, str) for tag in side)
+                    for side in supplied_edges
+                ):
+                    errors.append(f"{label}: 边缘对应不合法: edges 需要四组标签 (left, right, top, bottom)")
+                    continue
+                supplied = tuple(tuple(side) for side in supplied_edges)
+            for material_id, source in variant_sources.items():
+                old_tile = textures[source["old_texture_id"]]
+                if supplied is not None and old_tile.tile_edges is not None and supplied != old_tile.tile_edges:
+                    errors.append(
+                        f"{label}: 边缘对应不合法: 更新分片边缘标签与原分片 {material_name!r} 不一致"
+                    )
+                if supplied is not None and old_tile.tile_edges is None:
+                    errors.append(f"{label}: 边缘对应不合法: 原分片没有边缘标签")
+            parsed.append({
+                "label": label,
+                "material_name": material_name,
+                "usage": usage,
+                "position": (column, row),
+                "file": file_name,
+                "mime_type": mime_type,
+                "payload": payload,
+                "variant_sources": variant_sources,
+                "supplied_edges": supplied,
+            })
+
+        # Cross-entry checks: the update must be a uniform integer downscale
+        # within each (material, usage) batch, across every current variant.
+        ratio_groups: dict[tuple[str, str], tuple[int, int]] = {}
+        for item in parsed:
+            group_key = (item["material_name"], item["usage"])
+            scale: tuple[int, int] | None = None
+            for source in item["variant_sources"].values():
+                old_width, old_height = source["old_size"]
+                new_width, new_height = source["new_size"]
+                if (
+                    new_width > old_width or new_height > old_height
+                    or old_width * new_height != old_height * new_width
+                    or old_width % new_width != 0 or old_height % new_height != 0
+                ):
+                    errors.append(
+                        f"{item['label']}: 尺寸关系不合法: {new_width}x{new_height} 不是 "
+                        f"{old_width}x{old_height} 的整数倍缩小"
+                    )
+                    continue
+                candidate = (old_width // new_width, old_height // new_height)
+                if scale is None:
+                    scale = candidate
+                elif scale != candidate:
+                    errors.append(
+                        f"{item['label']}: 分辨率比例不一致: 同一更新批次中比例必须统一"
+                    )
+            if scale is not None:
+                previous = ratio_groups.get(group_key)
+                if previous is not None and previous != scale:
+                    errors.append(
+                        f"{item['label']}: 分辨率比例不一致: {group_key[1]} 用途已有 1:{previous[0]},"
+                        f" 本分片为 1:{scale[0]}"
+                    )
+                else:
+                    ratio_groups[group_key] = scale
+
+        node_filter = plan.get("nodes")
+        selected_nodes: set[str] | None = None
+        if node_filter is not None:
+            if not isinstance(node_filter, list) or not all(isinstance(item, str) for item in node_filter):
+                errors.append("nodes 必须是节点名称或节点 id 列表")
+            else:
+                selected_nodes = self._resolve_node_names(nodes, node_filter, "nodes", errors)
+        excluded = plan.get("exclude_nodes", [])
+        excluded_nodes: set[str] = set()
+        if not isinstance(excluded, list) or not all(isinstance(item, str) for item in excluded):
+            errors.append("exclude_nodes 必须是节点名称或节点 id 列表")
+        else:
+            excluded_nodes = self._resolve_node_names(nodes, excluded, "exclude_nodes", errors)
+        if selected_nodes is not None:
+            selected_nodes -= excluded_nodes
+        if errors:
+            return self._invalid_tile_report(asset_id, errors), None
+
+        root_asset_id = self._tile_base_chain(asset_id, self._load_index().get("tile_versions", {}), [])
+        return self._build_tile_version(
+            asset_id=asset_id,
+            closure=closure,
+            root_asset_id=root_asset_id,
+            parsed=parsed,
+            textures=textures,
+            images=images,
+            materials=materials,
+            meshes=meshes,
+            nodes=nodes,
+            scenes=scenes,
+            base_asset=base_asset,
+            plan_path=plan_path,
+            selected_nodes=selected_nodes,
+        )
+
+    @staticmethod
+    def _plan_kind(plan_path: Path | str) -> str:
+        try:
+            plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ImportErrorBundle([f"{plan_path}: unreadable or invalid JSON: {exc}"]) from exc
+        if not isinstance(plan, dict):
+            raise ImportErrorBundle([f"{plan_path}: plan must be a JSON object"])
+        if "tiles" in plan or "revert" in plan:
+            return "tiles"
+        return "retarget"
+
+    @staticmethod
+    def _invalid_tile_report(asset_id: str, errors: list[str]) -> dict[str, object]:
+        return {"asset_id": asset_id, "valid": False, "errors": errors, "updates": [], "regions": [], "kept_tiles": []}
+
+    @staticmethod
+    def _resolve_node_names(
+        nodes: dict[str, Node], wanted: list[str], label: str, errors: list[str]
+    ) -> set[str]:
+        resolved: set[str] = set()
+        for name in wanted:
+            if name in nodes:
+                resolved.add(name)
+                continue
+            matches = {oid for oid, node in nodes.items() if node.name == name}
+            if not matches:
+                errors.append(f"{label}: 找不到节点 {name!r}")
+                continue
+            resolved.update(matches)
+        return resolved
+
+    @staticmethod
+    def _tile_at(
+        tile_texture_ids: tuple[str, ...], textures: dict[str, Texture], column: int, row: int
+    ) -> str | None:
+        for texture_id in tile_texture_ids:
+            texture = textures.get(texture_id)
+            if texture is not None and texture.tile_position == (column, row):
+                return texture_id
+        return None
+
+    def _tile_base_chain(
+        self, asset_id: str, tile_versions: dict[str, object], errors: list[str]
+    ) -> str:
+        current = asset_id
+        seen: set[str] = set()
+        while current in tile_versions and current not in seen:
+            seen.add(current)
+            record = tile_versions[current]
+            if not isinstance(record, dict) or "root_asset_id" not in record:
+                errors.append(f"{current}: 分片版本溯源记录损坏")
+                break
+            current = record["root_asset_id"]
+        return current
+
+    def _build_tile_version(
+        self,
+        *,
+        asset_id: str,
+        closure: dict[str, object],
+        root_asset_id: str,
+        parsed: list[dict[str, object]],
+        textures: dict[str, Texture],
+        images: dict[str, Image],
+        materials: dict[str, Material],
+        meshes: dict[str, Mesh],
+        nodes: dict[str, Node],
+        scenes: dict[str, Scene],
+        base_asset: Asset,
+        plan_path: Path,
+        selected_nodes: set[str] | None = None,
+        revert_nodes: set[str] | None = None,
+    ) -> tuple[dict[str, object], tuple[Asset, dict[str, object], dict[str, object]] | None]:
+        new_objects: dict[str, object] = {}
+        material_cache: dict[tuple[str, tuple[tuple[str, str, int, int], ...]], str] = {}
+        root_materials: dict[str, Material] = {}
+        if revert_nodes:
+            root_closure = self._closure(root_asset_id)
+            root_materials = {oid: obj for oid, obj in root_closure.items() if isinstance(obj, Material)}
+
+        def updated_material(material_id: str, items: list[dict[str, object]]) -> str:
+            signature = tuple(
+                (item["material_name"], item["usage"], item["position"][0], item["position"][1])
+                for item in items
+            )
+            cache_key = (material_id, signature)
+            if cache_key in material_cache:
+                return material_cache[cache_key]
+            material = materials[material_id]
+            slots = list(material.tile_textures)
+            for item in items:
+                source = item["variant_sources"][material_id]
+                old_texture = textures[source["old_texture_id"]]
+                width, height = source["new_size"]
+                new_image = Image(
+                    Path(str(item["file"])).name,
+                    item["mime_type"],
+                    item["payload"],
+                )
+                new_objects[new_image.id()] = new_image
+                new_texture = Texture(
+                    old_texture.name,
+                    new_image.id(),
+                    old_texture.usage,
+                    old_texture.tex_coord,
+                    old_texture.tile_position,
+                    old_texture.tile_layout,
+                    old_texture.tile_edges,
+                )
+                new_objects[new_texture.id()] = new_texture
+                source["new_texture_id"] = new_texture.id()
+                source["new_image_id"] = new_image.id()
+                slot_index = next(
+                    index for index, (usage, _) in enumerate(slots) if usage == item["usage"]
+                )
+                tile_ids = list(slots[slot_index][1])
+                tile_index = tile_ids.index(source["old_texture_id"])
+                tile_ids[tile_index] = new_texture.id()
+                slots[slot_index] = (item["usage"], tuple(tile_ids))
+            updated = replace(material, tile_textures=tuple(slots))
+            if updated.id() != material_id:
+                new_objects[updated.id()] = updated
+            material_cache[cache_key] = updated.id()
+            return updated.id()
+
+        affected_materials: dict[str, list[dict[str, object]]] = {}
+        for item in parsed:
+            for material_id in item["variant_sources"]:
+                affected_materials.setdefault(material_id, []).append(item)
+
+        def node_is_selected(node_id: str) -> bool:
+            return selected_nodes is None or node_id in selected_nodes
+
+        # Surface regions per updated tile, for the preview and provenance.
+        regions: list[dict[str, object]] = []
+        node_mesh_override: dict[str, str] = {}
+        changed_node_ids: set[str] = set()
+        revert_nodes = revert_nodes or set()
+        for node_id, node in nodes.items():
+            if not node.mesh_id or node.mesh_id not in meshes:
+                continue
+            mesh = meshes[node.mesh_id]
+            new_bindings: list[tuple[str, int, int]] = []
+            changed = False
+            reverted = node_id in revert_nodes
+            for material_id, face_offset, face_count in mesh.material_bindings:
+                target_id = material_id
+                material = materials.get(material_id)
+                if reverted and material is not None:
+                    root_match = next(
+                        (oid for oid, candidate in root_materials.items() if candidate.name == material.name),
+                        None,
+                    )
+                    if root_match is not None and root_match != material_id:
+                        target_id = root_match
+                        changed = True
+                elif not reverted and material_id in affected_materials and node_is_selected(node_id):
+                    items = affected_materials[material_id]
+                    candidate = updated_material(material_id, items)
+                    if candidate != material_id:
+                        target_id = candidate
+                        changed = True
+                        changed_node_ids.add(node_id)
+                new_bindings.append((target_id, face_offset, face_count))
+                for item in affected_materials.get(material_id, []):
+                    if reverted or not node_is_selected(node_id):
+                        continue
+                    source = item["variant_sources"][material_id]
+                    regions.append({
+                        "node_id": node_id,
+                        "node_name": node.name,
+                        "mesh_id": node.mesh_id,
+                        "mesh_name": mesh.name,
+                        "material_id": material_id,
+                        "material_name": item["material_name"],
+                        "face_offset": face_offset,
+                        "face_count": face_count,
+                        "usage": item["usage"],
+                        "position": list(item["position"]),
+                        "old_texture_id": source["old_texture_id"],
+                        "old_image_id": source["old_image_id"],
+                    })
+            if changed:
+                new_mesh = Mesh(mesh.name, mesh.geometry_id, tuple(new_bindings))
+                new_objects[new_mesh.id()] = new_mesh
+                node_mesh_override[node_id] = new_mesh.id()
+
+        update_summaries: list[dict[str, object]] = []
+        for item in parsed:
+            first_source = next(iter(item["variant_sources"].values()))
+            old_texture = textures[first_source["old_texture_id"]]
+            neighbor_tags: dict[str, list[str]] = {}
+            if old_texture.tile_edges is not None:
+                column, row = item["position"]
+                layout = old_texture.tile_layout
+                assert layout is not None
+                for side, dcolumn, drow in ((1, 1, 0), (0, -1, 0), (2, 0, -1), (3, 0, 1)):
+                    neighbor = (column + dcolumn, row + drow)
+                    if 0 <= neighbor[0] < layout[0] and 0 <= neighbor[1] < layout[1]:
+                        neighbor_tags[f"{neighbor[0]},{neighbor[1]}"] = list(old_texture.tile_edges[side])
+            variant_identities = [
+                {
+                    "material_id": material_id,
+                    "new_texture_id": source.get("new_texture_id"),
+                    "new_image_id": source.get("new_image_id"),
+                }
+                for material_id, source in item["variant_sources"].items()
+            ]
+            summary = {
+                "material": item["material_name"],
+                "usage": item["usage"],
+                "position": list(item["position"]),
+                "file": item["file"],
+                "old_size": list(first_source["old_size"]),
+                "new_size": list(first_source["new_size"]),
+                "mime_type": item["mime_type"],
+                "edge_tags": [list(edge) for edge in old_texture.tile_edges] if old_texture.tile_edges else None,
+                "neighbor_edges": neighbor_tags,
+                "affected_nodes": sorted(
+                    node_id for node_id in changed_node_ids
+                    if any(
+                        bound_material in item["variant_sources"]
+                        for bound_material, _, _ in meshes[nodes[node_id].mesh_id].material_bindings
+                    )
+                ),
+            }
+            summary["variant_identities"] = variant_identities
+            update_summaries.append(summary)
+
+        # Tiles that remain on their old source: explicitly enumerated so a
+        # partial update can never be read as blank replacement images.
+        kept_tiles: list[dict[str, object]] = []
+        updated_keys = {
+            (item["material_name"], item["usage"], item["position"]) for item in parsed
+        }
+        adopted_materials: set[str] = set()
+        for node_id in changed_node_ids:
+            override_id = node_mesh_override[node_id]
+            new_mesh = new_objects[override_id]
+            assert isinstance(new_mesh, Mesh)
+            adopted_materials.update(material_id for material_id, _, _ in new_mesh.material_bindings)
+        material_namespace: dict[str, set[str]] = {}
+        for material_id, material in materials.items():
+            material_namespace.setdefault(material.name, set()).add(material_id)
+        touched_names = {item["material_name"] for item in parsed}
+        for material_id, material in materials.items():
+            if material.name in touched_names or revert_nodes:
+                pass
+            elif selected_nodes is None:
+                continue
+            elif not (material_namespace[material.name] & adopted_materials):
+                continue
+            for usage, tile_ids in material.tile_textures:
+                for tile_id in tile_ids:
+                    tile = textures[tile_id]
+                    key = (material.name, usage, tile.tile_position)
+                    if material_id in adopted_materials and key in updated_keys and material_id in affected_materials:
+                        continue
+                    kept_tiles.append({
+                        "material": material.name,
+                        "material_id": material_id,
+                        "usage": usage,
+                        "position": list(tile.tile_position) if tile.tile_position else None,
+                        "texture_id": tile_id,
+                        "image_id": tile.image_id,
+                    })
+
+        rebuilt_nodes: dict[str, str] = {}
+
+        def rebuild_node(node_id: str) -> str:
+            if node_id in rebuilt_nodes:
+                return rebuilt_nodes[node_id]
+            node = nodes[node_id]
+            new_children = tuple(rebuild_node(child) for child in node.children if child in nodes)
+            new_mesh_id = node_mesh_override.get(node_id, node.mesh_id)
+            if new_children == node.children and new_mesh_id == node.mesh_id:
+                rebuilt_nodes[node_id] = node_id
+                return node_id
+            new_node = Node(node.name, node.transform, new_mesh_id, new_children, node.skin_id)
+            new_objects[new_node.id()] = new_node
+            rebuilt_nodes[node_id] = new_node.id()
+            return new_node.id()
+
+        scene_replacements: dict[str, str] = {}
+        for scene_id, scene in scenes.items():
+            new_roots = tuple(rebuild_node(root) for root in scene.root_node_ids if root in nodes)
+            if new_roots != scene.root_node_ids:
+                new_scene = Scene(scene.name, new_roots)
+                new_objects[new_scene.id()] = new_scene
+                scene_replacements[scene_id] = new_scene.id()
+
+        new_scene_ids = tuple(scene_replacements.get(sid, sid) for sid in base_asset.scene_ids)
+        new_asset = Asset(base_asset.source_format, new_scene_ids)
+        new_objects[new_asset.id()] = new_asset
+
+        tile_entries_record: list[dict[str, object]] = []
+        for item in parsed:
+            variants = []
+            for material_id, source in item["variant_sources"].items():
+                variants.append({
+                    "material_id": material_id,
+                    "old_texture_id": source["old_texture_id"],
+                    "old_image_id": source["old_image_id"],
+                })
+            tile_entries_record.append({
+                "material": item["material_name"],
+                "usage": item["usage"],
+                "position": list(item["position"]),
+                "file": item["file"],
+                "variants": variants,
+            })
+        provenance = {
+            "kind": "tile-version",
+            "base_asset_id": asset_id,
+            "root_asset_id": root_asset_id,
+            "nodes": sorted(selected_nodes) if selected_nodes is not None else None,
+            "revert_nodes": sorted(revert_nodes),
+            "tiles": tile_entries_record,
+            "kept_tiles": kept_tiles,
+        }
+        record = {"plan": f"tile-version:{plan_path.name}", "provenance": provenance}
+        node_name_by_id = {node_id: node.name for node_id, node in nodes.items()}
+        for region in regions:
+            region["node_name"] = node_name_by_id[region["node_id"]]
+        report = {
+            "asset_id": asset_id,
+            "valid": True,
+            "errors": [],
+            "updates": update_summaries,
+            "regions": sorted(regions, key=lambda entry: (entry["node_id"], entry["usage"], entry["position"])),
+            "kept_tiles": kept_tiles,
+            "reverted_nodes": sorted(node_name_by_id[node_id] for node_id in revert_nodes),
+            "new_asset_id": new_asset.id(),
+        }
+        return report, (new_asset, new_objects, record)
 
     def _prepare_retarget(
         self, asset_id: str, plan_path: Path | str
@@ -434,6 +1088,9 @@ class ResourceLibrary:
                     texture_id = getattr(obj, field_name)
                     if texture_id:
                         visit(texture_id)
+                for _usage, texture_ids in obj.tile_textures:
+                    for texture_id in texture_ids:
+                        visit(texture_id)
             elif isinstance(obj, Node):
                 if obj.mesh_id:
                     visit(obj.mesh_id)
@@ -670,6 +1327,8 @@ class ResourceLibrary:
         if not self.index_path.exists():
             return {"version": 1, "assets": {}, "objects": {}}
         data = json.loads(self.index_path.read_text(encoding="utf-8"))
-        if not {"version", "assets", "objects"} <= set(data) <= {"version", "assets", "objects", "retargets"}:
+        if not {"version", "assets", "objects"} <= set(data) <= {
+            "version", "assets", "objects", "retargets", "tile_versions",
+        }:
             raise ValueError("invalid library index")
         return data
