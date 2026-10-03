@@ -68,6 +68,55 @@ class Texture:
 
 
 @dataclass(frozen=True)
+class TextureTile:
+    tile_id: str
+    x: int
+    y: int
+    width: int
+    height: int
+    image_id: str
+    source_tile_id: str | None = None
+    source_image_id: str | None = None
+    source_texture_id: str | None = None
+
+    def data(self) -> dict[str, Any]:
+        return {
+            "tile_id": self.tile_id,
+            "x": self.x,
+            "y": self.y,
+            "width": self.width,
+            "height": self.height,
+            "image_id": self.image_id,
+            "source_tile_id": self.source_tile_id,
+            "source_image_id": self.source_image_id,
+            "source_texture_id": self.source_texture_id,
+        }
+
+
+@dataclass(frozen=True)
+class TiledTexture:
+    name: str
+    usage: Literal["color", "data", "normal", "occlusion", "emissive"]
+    tiles: tuple[TextureTile, ...]
+    atlas_width: int = 0
+    atlas_height: int = 0
+    tex_coord: int = 0
+
+    def id(self) -> str:
+        return content_id("ttx", self.data())
+
+    def data(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "usage": self.usage,
+            "atlas_width": self.atlas_width,
+            "atlas_height": self.atlas_height,
+            "tex_coord": self.tex_coord,
+            "tiles": [tile.data() for tile in self.tiles],
+        }
+
+
+@dataclass(frozen=True)
 class Material:
     name: str
     base_color_factor: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
@@ -83,6 +132,7 @@ class Material:
     emissive_factor: tuple[float, float, float] = (0.0, 0.0, 0.0)
     normal_scale: float = 1.0
     occlusion_strength: float = 1.0
+    tiled_texture_ids: dict[str, str] = field(default_factory=dict)
 
     def id(self) -> str:
         return content_id("mat", self.data())
@@ -103,6 +153,7 @@ class Material:
             "emissive_factor": list(self.emissive_factor),
             "normal_scale": self.normal_scale,
             "occlusion_strength": self.occlusion_strength,
+            "tiled_texture_ids": dict(sorted(self.tiled_texture_ids.items())),
         }
 
 

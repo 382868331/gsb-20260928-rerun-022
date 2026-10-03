@@ -1,7 +1,7 @@
 """Content-addressed 3D resource pipeline."""
 
 from .library import ResourceLibrary
-from .models import Asset, Geometry, Image, Material, Mesh, Node, Scene, Skin, Texture
+from .models import Asset, Geometry, Image, Material, Mesh, Node, Scene, Skin, TextureTile, TiledTexture, Texture
 
 __all__ = [
     "Asset",
@@ -14,4 +14,6 @@ __all__ = [
     "Scene",
     "Skin",
     "Texture",
+    "TextureTile",
+    "TiledTexture",
 ]

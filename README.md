@@ -6,7 +6,7 @@
 
 - glTF 2.0 `.gltf`，内嵌 `data:application/octet-stream;base64` 或同批相对外部 buffer。
 - 三角形图元；`POSITION`、可选 `NORMAL`、标量索引；非索引图元会按连续三点转换。
-- PBR `pbrMetallicRoughness` 材质因子、`alphaMode`、`doubleSided`、`emissiveFactor`，以及 `baseColorTexture`（颜色用途，sRGB 内容）、`metallicRoughnessTexture`（数据用途，线性内容）、`normalTexture`（含 `scale`）、`occlusionTexture`（含 `strength`）与 `emissiveTexture`。
+- PBR `pbrMetallicRoughness` 材质因子、`alphaMode`、`doubleSided`、`emissiveFactor`，以及 `baseColorTexture`（颜色用途，sRGB 内容）、`metallicRoughnessTexture`（数据用途，线性内容）、`normalTexture`（含 `scale`）、`occlusionTexture`（含 `strength`）与 `emissiveTexture`。同类材质槽还支持分片版 `baseColorTileTexture`、`metallicRoughnessTileTexture`、`normalTileTexture`、`occlusionTileTexture`、`emissiveTileTexture`。
 - 贴图来源支持外部相对文件、内嵌 `data:` 与 `bufferView`（PNG/JPEG）。同一图像被多个材质或多种用途引用时共享同一 `img_` 身份；颜色、数据、法线、遮蔽、自发光用途分别生成独立的 `tex_` 身份，数据贴图不会被当成颜色处理。
 - 蒙皮网格：`JOINTS_0`/`WEIGHTS_0`（VEC4，整数关节、浮点权重）、`skins[].joints`、可选 `skeleton` 与列主序 `inverseBindMatrices`（MAT4）。
 - 节点 TRS 或 16 元素矩阵、嵌套层级和多图元材质区间；蒙皮节点通过 `skin` 引用皮肤对象。
@@ -20,6 +20,7 @@
 - `geo_`：位置、三角形索引、可选法线、可选每顶点 4 关节索引与 4 权重。
 - `img_`：图像 MIME 与字节内容（内容寻址，天然去重）。
 - `tex_`：`image_id` + 用途（`color`/`data`/`normal`/`occlusion`/`emissive`）+ `texCoord`。
+- `ttx_`：分片贴图版本，由用途、`texCoord`、图集宽高和有序分片组成；每片记录位置、实际像素宽高、当前 `img_`，以及更新前来源片和来源图。
 - `mat_`：材质参数、自发光因子、法线缩放、遮蔽强度与各用途贴图引用。
 - `msh_`：几何引用和 `(material_id, face_offset, face_count)` 材质绑定。
 - `skn_`：关节节点引用列表与每关节 4x4 逆绑定矩阵。
@@ -71,6 +72,47 @@ python3 -m resource3d.cli rollback --library build/library --asset "$NEW_ASSET"
 - 只选择部分物体时，被选节点得到新的材质/网格/节点版本，未选对象保持原有内容寻址身份，共享关系不会把它们一起带走。
 - 新图像与贴图仍是内容寻址对象：重复执行同一计划得到同一资产 ID，索引中的 `retargets` 记录只保留一份来源（基资产 + 各项替换），不会产生内容相同但来源不清的资源。
 - 重新导出新资产即可复现各物体的分辨率选择；`rollback` 结合原资产 ID 可回到原图版本。
+
+## 分片贴图选择性版本
+
+顶层 `tileTextures` 用受限 JSON 描述多片图集。分片必须无重叠、无缝覆盖整个图集，且每块声明的宽高必须与图像实际像素一致：
+
+```json
+{
+  "name": "character-color",
+  "usage": "color",
+  "atlas_width": 4,
+  "atlas_height": 4,
+  "tiles": [
+    {"id": "head", "x": 0, "y": 0, "width": 2, "height": 2, "source": 0},
+    {"id": "body", "x": 2, "y": 0, "width": 2, "height": 2, "source": 1}
+  ]
+}
+```
+
+材质槽使用 `baseColorTileTexture`、`normalTileTexture` 等引用。相同字节仍只有一个 `img_`；即使同一张图出现在不同分片位置，或同时作为颜色/法线/遮蔽解释，也会生成不同的 `ttx_` 分片身份，不会按内容相同而交换坐标或用途。
+
+部分更新仍走 `retarget`，但计划使用 `tile_updates`。未列入 `tiles` 的分片明确按“沿用旧图”处理，绝不会因缺文件而生成空白覆盖：
+
+```json
+{
+  "tile_updates": [
+    {
+      "tiled_texture": "character-color",
+      "usage": "color",
+      "tiles": {"head": {"file": "head-new.png"}},
+      "nodes": ["hero"]
+    }
+  ]
+}
+```
+
+- 预演报告列出受影响节点、材质、用途、更新片、沿用片、图集尺寸、每片旧/新尺寸、共享边缘和缺失区域；颜色、法线、遮蔽可以分别提供不同完整程度。
+- 新分片必须保持原 MIME，宽高为旧片的等比例整数缩小且不放大；位置、用途和共享边缘保持不变，错误会按片聚合，整次发布拒绝。
+- `nodes` 只选择对象；被选节点获得新材质/网格/节点版本，未选节点的 `mat_`、`msh_`、`ndo_` ID 完全不变。
+- 发布后的 `ttx_` 同时包含新片的 `img_` 来源和沿用片的旧来源；索引 `retargets[].tile_updates` 记录采用对象、每片 updated/retained 状态、边界与来源 ID。重新导出可完整重现组合，后续补齐缺失片或撤回某对象采用时能沿来源链追溯。
+- 撤回时使用 `{"withdraw": true, "tiled_texture": "...", "nodes": [...]}`，系统从该版各片的 `source_texture_id/source_tile_id/source_image_id` 恢复来源版本，并只为被选节点生成旧组合材质。
+- 预演失败或提交异常时保留既有资产和索引；同一计划重复提交仍得到同一资产 ID，不会发布来源不明的半成品。
 
 ## 快速开始
 

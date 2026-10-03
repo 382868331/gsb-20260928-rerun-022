@@ -9,7 +9,8 @@ from urllib.parse import unquote, urlparse
 
 from .errors import ImportErrorBundle
 from .math3d import Identity, trs
-from .models import Asset, Geometry, Image, Material, Mesh, Node, Scene, Skin, Texture
+from .retarget import image_dimensions
+from .models import Asset, Geometry, Image, Material, Mesh, Node, Scene, Skin, Texture, TextureTile, TiledTexture
 
 COMPONENT_TYPES = {
     5120: ("b", 1),
@@ -22,7 +23,7 @@ COMPONENT_TYPES = {
 TYPE_COUNTS = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}
 ALLOWED_TOP_LEVEL = {
     "asset", "scene", "scenes", "nodes", "meshes", "materials",
-    "accessors", "bufferViews", "buffers", "images", "textures", "skins",
+    "accessors", "bufferViews", "buffers", "images", "textures", "tileTextures", "skins",
     "extensionsUsed", "extensionsRequired",
 }
 IMAGE_MIME_TYPES = {"image/png", "image/jpeg"}
@@ -52,6 +53,7 @@ class GltfImporter:
 
         self.images = [self._image(index) for index, item in enumerate(self._objects("images"))]
         self.textures = [self._texture(index) for index, item in enumerate(self._objects("textures"))]
+        self.tiled_textures = [self._tiled_texture(index) for index, item in enumerate(self._objects("tileTextures"))]
         self.bound_textures: dict[str, Texture] = {}
         materials = [self._material(index) for index, item in enumerate(self._objects("materials"))]
         meshes = [self._mesh(index, materials) for index, item in enumerate(self._objects("meshes"))]
@@ -67,7 +69,7 @@ class GltfImporter:
         for texture in self.textures:
             if texture.image_id and texture.id() not in self.bound_textures:
                 all_textures.append(texture)
-        for item in [*self.images, *all_textures, *materials, *self.geometries, *meshes, *skins, *nodes, *scenes]:
+        for item in [*self.images, *all_textures, *self.tiled_textures, *materials, *self.geometries, *meshes, *skins, *nodes, *scenes]:
             objects[item.id()] = item
         asset = Asset("gltf-2.0", tuple(scene.id() for scene in scenes))
         objects[asset.id()] = asset
@@ -103,7 +105,7 @@ class GltfImporter:
                 self.errors.append(f"invalid top-level type for {key}")
         for key in (
             "buffers", "bufferViews", "accessors", "nodes", "meshes", "materials",
-            "scenes", "images", "textures", "skins",
+            "scenes", "images", "textures", "tileTextures", "skins",
         ):
             if key in doc and not isinstance(doc[key], list):
                 self.errors.append(f"{key} must be an array")
@@ -232,6 +234,87 @@ class GltfImporter:
             self.errors.append(f"materials[{material_index}].{key}: {exc}")
             return None
 
+    def _tiled_texture(self, index: int) -> TiledTexture:
+        fallback = TiledTexture(f"tiled-texture-{index}", "color", (), 0, 0)
+        try:
+            item = self._objects("tileTextures")[index]
+            name = str(item.get("name", f"tiled-texture-{index}"))
+            usage = item.get("usage", "color")
+            if usage not in {"color", "data", "normal", "occlusion", "emissive"}:
+                raise ValueError(f"unsupported tiled texture usage {usage!r}")
+            tex_coord = int(item.get("texCoord", 0))
+            if tex_coord < 0:
+                raise ValueError("texCoord must be non-negative")
+            raw_tiles = item.get("tiles")
+            if not isinstance(raw_tiles, list) or not raw_tiles:
+                raise ValueError("tiles must be a non-empty array")
+            tiles = []
+            seen_ids: set[str] = set()
+            seen_rects: set[tuple[int, int, int, int]] = set()
+            atlas_width = int(item.get("atlas_width", 0))
+            atlas_height = int(item.get("atlas_height", 0))
+            if atlas_width <= 0 or atlas_height <= 0:
+                raise ValueError("atlas_width and atlas_height must be positive")
+            for tile_index, raw_tile in enumerate(raw_tiles):
+                if not isinstance(raw_tile, dict):
+                    raise ValueError(f"tiles[{tile_index}] must be an object")
+                tile_id = str(raw_tile.get("id", f"tile-{tile_index}"))
+                if tile_id in seen_ids:
+                    raise ValueError(f"duplicate tile id {tile_id!r}")
+                x, y = int(raw_tile["x"]), int(raw_tile["y"])
+                width, height = int(raw_tile["width"]), int(raw_tile["height"])
+                if x < 0 or y < 0 or width <= 0 or height <= 0:
+                    raise ValueError(f"tile {tile_id!r} has invalid bounds")
+                rect = (x, y, width, height)
+                if rect in seen_rects:
+                    raise ValueError(f"tile {tile_id!r} duplicates another tile position")
+                if x + width > atlas_width or y + height > atlas_height:
+                    raise ValueError(f"tile {tile_id!r} lies outside the atlas")
+                image_index = int(raw_tile["source"])
+                image = self.images[image_index]
+                if not image.payload:
+                    raise ValueError(f"tile {tile_id!r} references broken images[{image_index}]")
+                actual_width, actual_height = image_dimensions(image.mime_type, image.payload)
+                if (actual_width, actual_height) != (width, height):
+                    raise ValueError(
+                        f"tile {tile_id!r} declares {width}x{height}, image is {actual_width}x{actual_height}"
+                    )
+                seen_ids.add(tile_id)
+                seen_rects.add(rect)
+                tiles.append(TextureTile(tile_id, x, y, width, height, image.id()))
+            for first_index, first in enumerate(tiles):
+                for second in tiles[first_index + 1:]:
+                    if (
+                        first.x < second.x + second.width
+                        and second.x < first.x + first.width
+                        and first.y < second.y + second.height
+                        and second.y < first.y + first.height
+                    ):
+                        raise ValueError(f"tile {second.tile_id!r} overlaps another tile")
+            if sum(tile.width * tile.height for tile in tiles) != atlas_width * atlas_height:
+                raise ValueError("tiles must cover the complete atlas without gaps")
+            return TiledTexture(name, usage, tuple(tiles), atlas_width, atlas_height, tex_coord)  # type: ignore[arg-type]
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            self.errors.append(f"tileTextures[{index}]: {exc}")
+            return fallback
+
+    def _tiled_texture_binding(self, container: dict, key: str, material_index: int, usage: str) -> str | None:
+        raw = container.get(key)
+        if raw is None:
+            return None
+        try:
+            if not isinstance(raw, dict):
+                raise TypeError("tile texture info must be an object")
+            tiled = self.tiled_textures[int(raw["index"])]
+            if not tiled.tiles:
+                raise ValueError("references a broken tiled texture")
+            if tiled.usage != usage:
+                raise ValueError(f"expected {usage} tiled texture, got {tiled.usage}")
+            return tiled.id()
+        except (KeyError, TypeError, IndexError, ValueError) as exc:
+            self.errors.append(f"materials[{material_index}].{key}: {exc}")
+            return None
+
     def _read_accessor(self, index: int, expected_type: str) -> list[tuple[float, ...]]:
         try:
             accessor = self.accessors[index]
@@ -289,12 +372,23 @@ class GltfImporter:
             "occlusion": None,
             "emissive": None,
         }
+        tiled_texture_ids: dict[str, str] = {}
         if isinstance(pbr, dict):
-            texture_ids["color"] = self._texture_binding(pbr, "baseColorTexture", index, "color")
-            texture_ids["data"] = self._texture_binding(pbr, "metallicRoughnessTexture", index, "data")
-            texture_ids["normal"] = self._texture_binding(item, "normalTexture", index, "normal")
-            texture_ids["occlusion"] = self._texture_binding(item, "occlusionTexture", index, "occlusion")
-            texture_ids["emissive"] = self._texture_binding(item, "emissiveTexture", index, "emissive")
+            slot_bindings = (
+                ("color", pbr, "baseColorTexture", "baseColorTileTexture"),
+                ("data", pbr, "metallicRoughnessTexture", "metallicRoughnessTileTexture"),
+                ("normal", item, "normalTexture", "normalTileTexture"),
+                ("occlusion", item, "occlusionTexture", "occlusionTileTexture"),
+                ("emissive", item, "emissiveTexture", "emissiveTileTexture"),
+            )
+            for slot_usage, container, regular_key, tiled_key in slot_bindings:
+                if container.get(regular_key) is not None and container.get(tiled_key) is not None:
+                    self.errors.append(
+                        f"materials[{index}].{slot_usage}: cannot bind both {regular_key} and {tiled_key}"
+                    )
+                    continue
+                texture_ids[slot_usage] = self._texture_binding(container, regular_key, index, slot_usage)
+                tiled_texture_ids[slot_usage] = self._tiled_texture_binding(container, tiled_key, index, slot_usage)
         emissive_factor = item.get("emissiveFactor", [0.0, 0.0, 0.0])
         if not isinstance(emissive_factor, list) or len(emissive_factor) != 3:
             self.errors.append(f"materials[{index}] has invalid emissiveFactor")
@@ -315,6 +409,7 @@ class GltfImporter:
                 emissive_factor=tuple(float(value) for value in emissive_factor),
                 normal_scale=self._texture_scale(item, "normalTexture", "scale", index, 1.0),
                 occlusion_strength=self._texture_scale(item, "occlusionTexture", "strength", index, 1.0),
+                tiled_texture_ids={key: value for key, value in tiled_texture_ids.items() if value},
             )
         except (TypeError, ValueError):
             self.errors.append(f"materials[{index}] contains a non-numeric factor")

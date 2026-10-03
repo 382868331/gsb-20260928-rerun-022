@@ -9,7 +9,7 @@ from pathlib import Path
 from .errors import ImportErrorBundle
 from .gltf import GltfImporter
 from .hashing import canonical_json, sha256_bytes
-from .models import Asset, Geometry, Image, Material, Mesh, Node, Scene, Skin, Texture
+from .models import Asset, Geometry, Image, Material, Mesh, Node, Scene, Skin, TextureTile, TiledTexture, Texture
 from .retarget import image_dimensions
 
 TEXTURE_USAGES = (
@@ -53,6 +53,19 @@ class ResourceLibrary:
             return Image(data["name"], data["mime_type"], bytes.fromhex(data["payload"]))
         if kind == "tex":
             return Texture(data["name"], data["image_id"], data["usage"], data.get("tex_coord", 0))
+        if kind == "ttx":
+            tiles = tuple(
+                TextureTile(
+                    tile["tile_id"], tile["x"], tile["y"], tile["width"], tile["height"],
+                    tile["image_id"], tile.get("source_tile_id"), tile.get("source_image_id"),
+                    tile.get("source_texture_id"),
+                )
+                for tile in data["tiles"]
+            )
+            return TiledTexture(
+                data["name"], data["usage"], tiles,
+                data.get("atlas_width", 0), data.get("atlas_height", 0), data.get("tex_coord", 0),
+            )
         if kind == "mat":
             return Material(
                 data["name"],
@@ -69,6 +82,7 @@ class ResourceLibrary:
                 tuple(data.get("emissive_factor", (0.0, 0.0, 0.0))),
                 data.get("normal_scale", 1.0),
                 data.get("occlusion_strength", 1.0),
+                dict(data.get("tiled_texture_ids", {})),
             )
         if kind == "msh":
             return Mesh(
@@ -123,7 +137,7 @@ class ResourceLibrary:
         retargets = {**existing.get("retargets", {})}
         retargets[new_asset_id] = {
             "base_asset_id": asset_id,
-            "replacements": record["replacements"],
+            **{key: value for key, value in record.items() if key != "plan"},
         }
         self._commit(new_objects, {"version": 1, "assets": assets, "objects": merged, "retargets": retargets})
         report["new_asset_id"] = new_asset_id
@@ -143,8 +157,14 @@ class ResourceLibrary:
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ImportErrorBundle([f"{plan_path}: unreadable or invalid JSON: {exc}"]) from exc
-        if not isinstance(plan, dict) or not isinstance(plan.get("replacements"), list):
-            raise ImportErrorBundle([f"{plan_path}: plan must be an object with a replacements list"])
+        if not isinstance(plan, dict):
+            raise ImportErrorBundle([f"{plan_path}: plan must be an object"])
+        if "tile_updates" in plan:
+            if not isinstance(plan["tile_updates"], list) or "replacements" in plan:
+                raise ImportErrorBundle([f"{plan_path}: tile_updates must be a list and cannot be combined with replacements"])
+            return self._prepare_tile_update(asset_id, plan_path, plan)
+        if not isinstance(plan.get("replacements"), list):
+            raise ImportErrorBundle([f"{plan_path}: plan must contain replacements or tile_updates"])
 
         closure = self._closure(asset_id)
         images = {oid: obj for oid, obj in closure.items() if isinstance(obj, Image)}
@@ -413,6 +433,426 @@ class ResourceLibrary:
         }
         return report, (new_asset, new_objects, record)
 
+    def _prepare_tile_update(
+        self, asset_id: str, plan_path: Path, plan: dict[str, object]
+    ) -> tuple[dict[str, object], tuple[Asset, dict[str, object], dict[str, object]] | None]:
+        closure = self._closure(asset_id)
+        images = {oid: obj for oid, obj in closure.items() if isinstance(obj, Image)}
+        tiled = {oid: obj for oid, obj in closure.items() if isinstance(obj, TiledTexture)}
+        materials = {oid: obj for oid, obj in closure.items() if isinstance(obj, Material)}
+        meshes = {oid: obj for oid, obj in closure.items() if isinstance(obj, Mesh)}
+        nodes = {oid: obj for oid, obj in closure.items() if isinstance(obj, Node)}
+        scenes = {oid: obj for oid, obj in closure.items() if isinstance(obj, Scene)}
+        base_asset = closure[asset_id]
+        assert isinstance(base_asset, Asset)
+
+        def tiled_ref(ref: object) -> str | None:
+            if isinstance(ref, str) and ref in tiled:
+                return ref
+            if isinstance(ref, str):
+                matches = [oid for oid, value in tiled.items() if value.name == ref]
+                if len(matches) == 1:
+                    return matches[0]
+            return None
+
+        errors: list[str] = []
+        requests: list[dict[str, object]] = []
+        seen_tiled_textures: set[str] = set()
+        raw_updates = plan["tile_updates"]
+        assert isinstance(raw_updates, list)
+        for position, entry in enumerate(raw_updates):
+            label = f"tile_updates[{position}]"
+            if not isinstance(entry, dict):
+                errors.append(f"{label}: entry must be an object")
+                continue
+            texture_id = tiled_ref(entry.get("tiled_texture"))
+            if texture_id is None:
+                errors.append(f"{label}: 图像缺失: 资产中找不到分片贴图 {entry.get('tiled_texture')!r}")
+                continue
+            if texture_id in seen_tiled_textures:
+                errors.append(f"{label}: 同一分片贴图在一次更新中出现了多个互相冲突的条目")
+                continue
+            seen_tiled_textures.add(texture_id)
+            if entry.get("withdraw") is True:
+                node_filter = entry.get("nodes")
+                if not isinstance(node_filter, list) or not node_filter:
+                    errors.append(f"{label}: 撤回采用必须明确选择至少一个节点")
+                    continue
+                target_nodes = set()
+                for wanted in node_filter:
+                    matches = [oid for oid, node in nodes.items() if node.name == wanted or oid == wanted]
+                    if not matches:
+                        errors.append(f"{label}: 找不到节点 {wanted!r}")
+                    target_nodes.update(matches)
+                requests.append({
+                    "label": label,
+                    "old_tiled": tiled[texture_id],
+                    "requested": {},
+                    "target_nodes": target_nodes,
+                    "withdraw": True,
+                })
+                continue
+            old_tiled = tiled[texture_id]
+            usage = entry.get("usage", old_tiled.usage)
+            if usage != old_tiled.usage:
+                errors.append(f"{label}: 用途不兼容: 不能把 {old_tiled.usage} 分片当 {usage} 使用")
+                continue
+            old_by_id = {tile.tile_id: tile for tile in old_tiled.tiles}
+            raw_tiles = entry.get("tiles", {})
+            if not isinstance(raw_tiles, dict):
+                errors.append(f"{label}: tiles 必须是以分片 ID 为键的对象")
+                continue
+            requested: dict[str, TextureTile] = {}
+            explicit_tiles = 0
+            for tile_id, tile_spec in raw_tiles.items():
+                tile_label = f"{label}.tiles[{tile_id}]"
+                if tile_id not in old_by_id:
+                    errors.append(f"{tile_label}: 用途不兼容: 未知分片位置 {tile_id!r}")
+                    continue
+                old_tile = old_by_id[tile_id]
+                if tile_spec is None:
+                    explicit_tiles += 1
+                    requested[tile_id] = old_tile
+                    continue
+                if not isinstance(tile_spec, dict) or not isinstance(tile_spec.get("file"), str):
+                    errors.append(f"{tile_label}: 图像缺失: 未提供替换文件")
+                    continue
+                path = (plan_path.parent / tile_spec["file"]).resolve()
+                try:
+                    payload = path.read_bytes()
+                except OSError:
+                    errors.append(f"{tile_label}: 图像缺失: 无法读取 {tile_spec['file']}")
+                    continue
+                mime_type = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(path.suffix.lower(), "")
+                old_image = images[old_tile.image_id]
+                if mime_type not in ("image/png", "image/jpeg") or mime_type != old_image.mime_type:
+                    errors.append(f"{tile_label}: 用途不兼容: 替换图像必须保持 {old_image.mime_type}")
+                    continue
+                try:
+                    new_width, new_height = image_dimensions(mime_type, payload)
+                except ValueError as exc:
+                    errors.append(f"{tile_label}: 尺寸关系不合法: {exc}")
+                    continue
+                old_width, old_height = old_tile.width, old_tile.height
+                if (
+                    new_width > old_width or new_height > old_height
+                    or old_width * new_height != old_height * new_width
+                    or old_width % new_width or old_height % new_height
+                ):
+                    errors.append(
+                        f"{tile_label}: 尺寸关系不合法: {new_width}x{new_height} 不是 {old_width}x{old_height} 的等比整数缩小"
+                    )
+                    continue
+                image = Image(f"{old_image.name}#{tile_id}@{new_width}x{new_height}", mime_type, payload)
+                explicit_tiles += 1
+                requested[tile_id] = TextureTile(
+                    tile_id, old_tile.x, old_tile.y, old_tile.width, old_tile.height,
+                    image.id(), old_tile.tile_id, old_tile.image_id, old_tile.source_texture_id or old_tiled.id(),
+                )
+                requested[tile_id + "__image"] = image  # type: ignore[assignment]
+            node_filter = entry.get("nodes")
+            target_nodes: set[str] | None = None
+            if node_filter is not None:
+                if not isinstance(node_filter, list):
+                    errors.append(f"{label}: nodes 必须是节点名称或 ID 列表")
+                    continue
+                target_nodes = set()
+                for wanted in node_filter:
+                    matches = [oid for oid, node in nodes.items() if node.name == wanted or oid == wanted]
+                    if not matches:
+                        errors.append(f"{label}: 找不到节点 {wanted!r}")
+                    target_nodes.update(matches)
+            requests.append({
+                "label": label,
+                "old_tiled": old_tiled,
+                "requested": requested,
+                "target_nodes": target_nodes,
+                "explicit_tiles": explicit_tiles,
+            })
+        if errors:
+            return {"asset_id": asset_id, "valid": False, "errors": errors, "changes": [], "missing_areas": []}, None
+
+        new_objects: dict[str, object] = {}
+        updates_by_old_texture: dict[str, dict[str, object]] = {}
+        summaries: list[dict[str, object]] = []
+        for request in requests:
+            old_tiled = request["old_tiled"]
+            assert isinstance(old_tiled, TiledTexture)
+            if request.get("withdraw"):
+                source_refs = {tile.source_texture_id for tile in old_tiled.tiles if tile.source_texture_id}
+                if len(source_refs) != 1 or not source_refs.intersection(tiled):
+                    errors.append(f"{request['label']}: 无法从来源记录恢复原始分片贴图")
+                    continue
+                original_id = next(iter(source_refs))
+                updates_by_old_texture[old_tiled.id()] = {
+                    "new": tiled[original_id],
+                    "request": request,
+                }
+                summaries.append({
+                    "old_tiled_texture_id": old_tiled.id(),
+                    "new_tiled_texture_id": original_id,
+                    "usage": old_tiled.usage,
+                    "atlas_size": [old_tiled.atlas_width, old_tiled.atlas_height],
+                    "nodes": sorted(request["target_nodes"]),
+                    "tiles": [
+                        {
+                            "tile_id": tile.tile_id,
+                            "x": tile.x,
+                            "y": tile.y,
+                            "width": tile.width,
+                            "height": tile.height,
+                            "image_id": tile.image_id,
+                            "state": "withdrawn",
+                            "source_tile_id": tile.source_tile_id,
+                            "source_image_id": tile.source_image_id,
+                            "source_texture_id": tile.source_texture_id,
+                        }
+                        for tile in old_tiled.tiles
+                    ],
+                    "retained_tile_ids": [],
+                    "edges": self._tile_edges(old_tiled),
+                    "action": "withdraw",
+                })
+                continue
+            requested = request["requested"]
+            assert isinstance(requested, dict)
+            if request.get("explicit_tiles", 0) == 0:
+                errors.append(f"{request['label']}: 没有任何分片发生变化")
+                continue
+            new_tiles = []
+            tile_summary = []
+            retained = []
+            for old_tile in old_tiled.tiles:
+                if old_tile.tile_id in requested:
+                    tile = requested[old_tile.tile_id]
+                    image = requested[old_tile.tile_id + "__image"]
+                    assert isinstance(image, Image)
+                    new_objects[image.id()] = image
+                    tile_summary.append({
+                        "tile_id": tile.tile_id,
+                        "x": tile.x,
+                        "y": tile.y,
+                        "width": tile.width,
+                        "height": tile.height,
+                        "old_image_id": old_tile.image_id,
+                        "new_image_id": tile.image_id,
+                        "old_size": [tile.width, tile.height],
+                        "new_size": [image_dimensions(image.mime_type, image.payload)[0], image_dimensions(image.mime_type, image.payload)[1]],
+                        "state": "updated",
+                    })
+                else:
+                    tile = TextureTile(
+                        old_tile.tile_id, old_tile.x, old_tile.y, old_tile.width, old_tile.height,
+                        old_tile.image_id,
+                        old_tile.source_tile_id or old_tile.tile_id,
+                        old_tile.source_image_id or old_tile.image_id,
+                        old_tile.source_texture_id or old_tiled.id(),
+                    )
+                    retained.append(old_tile.tile_id)
+                    tile_summary.append({
+                        "tile_id": tile.tile_id,
+                        "x": tile.x,
+                        "y": tile.y,
+                        "width": tile.width,
+                        "height": tile.height,
+                        "image_id": old_tile.image_id,
+                        "state": "retained",
+                    })
+                new_tiles.append(tile)
+            new_tiled = TiledTexture(
+                f"{old_tiled.name}#partial", old_tiled.usage, tuple(new_tiles),
+                old_tiled.atlas_width, old_tiled.atlas_height, old_tiled.tex_coord,
+            )
+            if all(tile.image_id == old_tiled.tiles[index].image_id for index, tile in enumerate(new_tiles)):
+                errors.append(f"{request['label']}: 没有任何分片发生变化")
+                continue
+            new_objects[new_tiled.id()] = new_tiled
+            updates_by_old_texture[old_tiled.id()] = {"new": new_tiled, "request": request}
+            summaries.append({
+                "old_tiled_texture_id": old_tiled.id(),
+                "new_tiled_texture_id": new_tiled.id(),
+                "usage": old_tiled.usage,
+                "atlas_size": [old_tiled.atlas_width, old_tiled.atlas_height],
+                "nodes": sorted(request["target_nodes"]) if request["target_nodes"] is not None else None,
+                "tiles": tile_summary,
+                "retained_tile_ids": retained,
+                "edges": self._tile_edges(new_tiled),
+                "action": "adopt",
+            })
+        if errors:
+            return {"asset_id": asset_id, "valid": False, "errors": errors, "changes": [], "missing_areas": []}, None
+
+        material_cache: dict[tuple[str, frozenset[str]], str] = {}
+
+        def material_for(material_id: str, adopted_texture_ids: frozenset[str]) -> str:
+            key = (material_id, adopted_texture_ids)
+            if key in material_cache:
+                return material_cache[key]
+            material = materials[material_id]
+            tiled_maps = dict(material.tiled_texture_ids)
+            for usage, tiled_id in list(tiled_maps.items()):
+                if tiled_id in adopted_texture_ids:
+                    tiled_maps[usage] = updates_by_old_texture[tiled_id]["new"].id()
+            updated = replace(material, tiled_texture_ids=tiled_maps)
+            if updated.id() != material_id:
+                new_objects[updated.id()] = updated
+            material_cache[key] = updated.id()
+            return updated.id()
+
+        changes: list[dict[str, object]] = []
+        node_mesh_override: dict[str, str] = {}
+        for node_id, node in nodes.items():
+            if not node.mesh_id or node.mesh_id not in meshes:
+                continue
+            mesh = meshes[node.mesh_id]
+            applicable: dict[str, dict[str, object]] = {}
+            for material_id, _, _ in mesh.material_bindings:
+                material = materials.get(material_id)
+                if material is None:
+                    continue
+                for usage, old_tiled_id in material.tiled_texture_ids.items():
+                    update = updates_by_old_texture.get(old_tiled_id)
+                    if update is None:
+                        continue
+                    targets = update["request"]["target_nodes"]
+                    if targets is None or node_id in targets:
+                        applicable[old_tiled_id] = update
+            if not applicable:
+                continue
+            new_bindings = []
+            for material_id, offset, count in mesh.material_bindings:
+                material = materials[material_id]
+                chosen = material_id
+                material_applicable = frozenset(
+                    old_tiled_id for old_tiled_id in material.tiled_texture_ids.values()
+                    if old_tiled_id in applicable
+                )
+                if material_applicable:
+                    chosen = material_for(material_id, material_applicable)
+                    chosen_material = materials.get(chosen) or new_objects[chosen]
+                    assert isinstance(chosen_material, Material)
+                    for usage, old_tex_id in material.tiled_texture_ids.items():
+                        new_tex_id = chosen_material.tiled_texture_ids.get(usage)
+                        if old_tex_id in material_applicable and new_tex_id:
+                            update_summary = next(item for item in summaries if item["old_tiled_texture_id"] == old_tex_id)
+                            changes.append({
+                                "node_id": node_id,
+                                "node_name": node.name,
+                                "mesh_id": mesh.id(),
+                                "material_name": material.name,
+                                "usage": usage,
+                                "old_tiled_texture_id": old_tex_id,
+                                "new_tiled_texture_id": new_tex_id,
+                                "updated_tile_ids": [
+                                    tile["tile_id"] for tile in update_summary["tiles"]
+                                    if tile["state"] == "updated"
+                                ],
+                                "retained_tile_ids": [
+                                    tile["tile_id"] for tile in update_summary["tiles"]
+                                    if tile["state"] == "retained"
+                                ],
+                                "atlas_size": update_summary["atlas_size"],
+                            })
+                new_bindings.append((chosen, offset, count))
+            new_bindings_tuple = tuple(new_bindings)
+            if new_bindings_tuple != mesh.material_bindings:
+                new_mesh = Mesh(mesh.name, mesh.geometry_id, new_bindings_tuple)
+                new_objects[new_mesh.id()] = new_mesh
+                node_mesh_override[node_id] = new_mesh.id()
+
+        rebuilt_nodes: dict[str, str] = {}
+
+        def rebuild_node(node_id: str) -> str:
+            if node_id in rebuilt_nodes:
+                return rebuilt_nodes[node_id]
+            node = nodes[node_id]
+            child_ids = tuple(rebuild_node(child) for child in node.children if child in nodes)
+            mesh_id = node_mesh_override.get(node_id, node.mesh_id)
+            if child_ids == node.children and mesh_id == node.mesh_id:
+                rebuilt_nodes[node_id] = node_id
+                return node_id
+            rebuilt = Node(node.name, node.transform, mesh_id, child_ids, node.skin_id)
+            new_objects[rebuilt.id()] = rebuilt
+            rebuilt_nodes[node_id] = rebuilt.id()
+            return rebuilt.id()
+
+        scene_map = {}
+        for scene_id, scene in scenes.items():
+            roots = tuple(rebuild_node(root) for root in scene.root_node_ids if root in nodes)
+            if roots != scene.root_node_ids:
+                rebuilt_scene = Scene(scene.name, roots)
+                new_objects[rebuilt_scene.id()] = rebuilt_scene
+                scene_map[scene_id] = rebuilt_scene.id()
+        new_asset = Asset(base_asset.source_format, tuple(scene_map.get(sid, sid) for sid in base_asset.scene_ids))
+        new_objects[new_asset.id()] = new_asset
+        missing_areas = [
+            {
+                "tiled_texture_id": item["old_tiled_texture_id"],
+                "usage": item["usage"],
+                "missing_tile_ids": item["retained_tile_ids"],
+                "policy": "retain-old-image",
+            }
+            for item in summaries if item["retained_tile_ids"]
+        ]
+        report = {
+            "asset_id": asset_id,
+            "valid": True,
+            "errors": [],
+            "changes": sorted(changes, key=lambda item: (item["node_id"], item["usage"])),
+            "missing_areas": missing_areas,
+            "tile_updates": summaries,
+            "new_asset_id": new_asset.id(),
+        }
+        record = {
+            "plan": f"tile-retarget:{plan_path.name}",
+            "tile_updates": summaries,
+        }
+        return report, (new_asset, new_objects, record)
+
+    @staticmethod
+    def _tile_edges(texture: TiledTexture) -> list[dict[str, object]]:
+        edges: list[dict[str, object]] = []
+        tiles = list(texture.tiles)
+        for index, first in enumerate(tiles):
+            for second in tiles[index + 1:]:
+                if first.x + first.width == second.x:
+                    overlap_start = max(first.y, second.y)
+                    overlap_end = min(first.y + first.height, second.y + second.height)
+                    if overlap_start < overlap_end:
+                        edges.append({
+                            "a": first.tile_id, "b": second.tile_id,
+                            "side": "x", "coordinate": second.x,
+                            "start": overlap_start, "end": overlap_end,
+                        })
+                if second.x + second.width == first.x:
+                    overlap_start = max(first.y, second.y)
+                    overlap_end = min(first.y + first.height, second.y + second.height)
+                    if overlap_start < overlap_end:
+                        edges.append({
+                            "a": second.tile_id, "b": first.tile_id,
+                            "side": "x", "coordinate": first.x,
+                            "start": overlap_start, "end": overlap_end,
+                        })
+                if first.y + first.height == second.y:
+                    overlap_start = max(first.x, second.x)
+                    overlap_end = min(first.x + first.width, second.x + second.width)
+                    if overlap_start < overlap_end:
+                        edges.append({
+                            "a": first.tile_id, "b": second.tile_id,
+                            "side": "y", "coordinate": second.y,
+                            "start": overlap_start, "end": overlap_end,
+                        })
+                if second.y + second.height == first.y:
+                    overlap_start = max(first.x, second.x)
+                    overlap_end = min(first.x + first.width, second.x + second.width)
+                    if overlap_start < overlap_end:
+                        edges.append({
+                            "a": second.tile_id, "b": first.tile_id,
+                            "side": "y", "coordinate": first.y,
+                            "start": overlap_start, "end": overlap_end,
+                        })
+        return sorted(edges, key=lambda edge: (edge["side"], edge["coordinate"], edge["start"], edge["a"], edge["b"]))
+
     def _closure(self, asset_id: str) -> dict[str, object]:
         asset = self.load_object(asset_id)
         assert isinstance(asset, Asset)
@@ -425,6 +865,9 @@ class ResourceLibrary:
             collected[object_id] = obj
             if isinstance(obj, Texture):
                 visit(obj.image_id)
+            elif isinstance(obj, TiledTexture):
+                for tile in obj.tiles:
+                    visit(tile.image_id)
             elif isinstance(obj, Mesh):
                 visit(obj.geometry_id)
                 for material_id, _, _ in obj.material_bindings:
@@ -434,6 +877,8 @@ class ResourceLibrary:
                     texture_id = getattr(obj, field_name)
                     if texture_id:
                         visit(texture_id)
+                for tiled_texture_id in obj.tiled_texture_ids.values():
+                    visit(tiled_texture_id)
             elif isinstance(obj, Node):
                 if obj.mesh_id:
                     visit(obj.mesh_id)
