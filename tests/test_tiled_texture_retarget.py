@@ -378,7 +378,100 @@ class TiledTextureRetargetTests(unittest.TestCase):
         self.assertEqual(reopened, combined_asset)
         withdrawn_again, _ = self.library.apply_retarget(combined_asset, withdraw)
         self.assertEqual(withdrawn_again, withdrawn_asset)
-        self.assertEqual(len(json.loads(self.library.index_path.read_text())["assets"]), 3)
+
+    def test_tile_review_preserves_pending_selected_and_deferred_ranges(self) -> None:
+        (self.batch / "c1.png").write_bytes(png(1, 1, 3))
+        (self.batch / "c2.png").write_bytes(png(1, 1, 5))
+        plan = self.write_plan("review-plan.json", [
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c1.png"}}, "nodes": ["object-a"]},
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c2.png"}}, "nodes": ["object-a"]},
+            {"tiled_texture": "atlas-color", "tiles": {"right": {"file": "c1.png"}}, "nodes": ["object-a"]},
+            {"tiled_texture": "atlas-color", "tiles": {"right": {"file": "c2.png"}}, "nodes": ["object-a"]},
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c1.png"}}, "nodes": ["object-b"]},
+        ])
+        initial = self.library.plan_retarget(self.asset_id, plan)
+        self.assertFalse(initial["valid"])
+        self.assertEqual(len(initial["review"]["unresolved_overlaps"]), 2)
+        self.assertEqual(len(json.loads(self.library.index_path.read_text())["assets"]), 1)
+
+        review = self.batch / "review.json"
+        saved = self.library.save_tile_review(self.asset_id, plan, review, [
+            {"candidate_id": "candidate-1", "node_id": "object-a", "tile_ids": ["left"], "status": "selected"},
+            {"candidate_id": "candidate-4", "node_id": "object-b", "tile_ids": ["left"], "status": "deferred"},
+        ])
+        saved_data = json.loads(review.read_text())
+        self.assertEqual(saved_data["plan_path"], str(plan))
+        self.assertNotEqual(review, plan)
+        self.assertEqual(len(saved["review"]["unresolved_overlaps"]), 1)
+        self.assertEqual(
+            {(item["node_name"], item["tile_id"]) for item in saved["review"]["unresolved_overlaps"]},
+            {("object-a", "right")},
+        )
+        selected = next(item for item in saved_data["choices"] if item["status"] == "selected")
+        self.assertEqual(selected["node_name"], "object-a")
+        self.assertTrue(selected["tiled_texture_id"].startswith("ttx_"))
+        self.assertEqual(selected["tile_id"], "left")
+        self.assertTrue(selected["file_sha256"])
+        deferred = next(item for item in saved_data["choices"] if item["status"] == "deferred")
+        self.assertEqual((deferred["node_name"], deferred["tile_id"]), ("object-b", "left"))
+        self.assertEqual(len(json.loads(self.library.index_path.read_text())["assets"]), 1)
+
+        reopened = self.library.plan_retarget(self.asset_id, plan, review)
+        self.assertFalse(reopened["valid"])
+        self.assertTrue(any("重叠" in error for error in reopened["errors"]))
+        self.assertEqual(len(reopened["review"]["unresolved_overlaps"]), 1)
+        self.assertEqual(
+            {(item["candidate_id"], item["node_name"], item["tile_id"], item["status"])
+             for item in reopened["review"]["choices"]},
+            {("candidate-1", "object-a", "left", "selected"), ("candidate-4", "object-b", "left", "deferred")},
+        )
+
+        before_index = self.library.index_path.read_text()
+        (self.batch / "c2.png").write_bytes(png(1, 1, 9))
+        changed_report = self.library.plan_retarget(self.asset_id, plan, review)
+        changed_choices = {
+            (item["candidate_id"], item["node_name"], item["tile_id"], item["status"]): item["needs_reconfirmation"]
+            for item in changed_report["review"]["choices"]
+        }
+        self.assertEqual(len(changed_report["review"]["choices"]), 2)
+        self.assertEqual(len(changed_report["review"]["unresolved_overlaps"]), 1)
+        selected_key = next(key for key in changed_choices if key[3] == "selected")
+        deferred_key = next(key for key in changed_choices if key[3] == "deferred")
+        self.assertTrue(changed_choices[selected_key])
+        self.assertFalse(changed_choices[deferred_key])
+        with self.assertRaises(ImportErrorBundle):
+            self.library.apply_retarget(self.asset_id, plan, review)
+        self.assertEqual(before_index, self.library.index_path.read_text())
+
+        alternate = self.batch / "alternate-review.json"
+        self.library.save_tile_review_as(self.asset_id, plan, review, alternate, [
+            {"candidate_id": "candidate-0", "node_id": "object-a", "tile_ids": ["left"], "status": "selected"},
+            {"candidate_id": "candidate-3", "node_id": "object-a", "tile_ids": ["right"], "status": "selected"},
+        ])
+        self.assertEqual(self.library.index_path.read_text(), before_index)
+        alternate_preview = self.library.plan_retarget(self.asset_id, plan, alternate)
+        self.assertTrue(alternate_preview["valid"], alternate_preview["errors"])
+        alternate_asset, alternate_report = self.library.apply_retarget(self.asset_id, plan, alternate)
+        alternate_objects = self.objects(alternate_asset)
+        old_objects = self.objects(self.asset_id)
+        old_color = next(oid for oid, item in old_objects.items() if item.get("name") == "atlas-color")
+        self.assertEqual(self.color_texture_id(alternate_objects, "object-b"), old_color)
+        self.assertEqual(
+            {change["node_name"] for change in alternate_report["changes"]},
+            {"object-a"},
+        )
+        alternate_tiles = {
+            tile["tile_id"]: tile
+            for tile in alternate_objects[self.color_texture_id(alternate_objects, "object-a")]["tiles"]
+        }
+        old_tiles = {tile["tile_id"]: tile for tile in old_objects[old_color]["tiles"]}
+        self.assertNotEqual(alternate_tiles["left"]["image_id"], old_tiles["left"]["image_id"])
+        self.assertNotEqual(alternate_tiles["right"]["image_id"], old_tiles["right"]["image_id"])
+        alternate_again, _ = self.library.apply_retarget(self.asset_id, plan, alternate)
+        self.assertEqual(alternate_again, alternate_asset)
+        with self.assertRaises(ImportErrorBundle):
+            self.library.apply_retarget(self.asset_id, plan, review)
+        self.assertEqual(len(json.loads(self.library.index_path.read_text())["assets"]), 2)
 
     def test_invalid_candidate_cannot_borrow_same_name_same_size_file(self) -> None:
         (self.batch / "c1.png").write_bytes(png(1, 1, 3))

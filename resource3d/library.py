@@ -120,12 +120,16 @@ class ResourceLibrary:
         )
         return destination
 
-    def plan_retarget(self, asset_id: str, plan_path: Path | str) -> dict[str, object]:
-        report, _ = self._prepare_retarget(asset_id, plan_path)
+    def plan_retarget(
+        self, asset_id: str, plan_path: Path | str, review_path: Path | str | None = None
+    ) -> dict[str, object]:
+        report, _ = self._prepare_retarget(asset_id, plan_path, review_path)
         return report
 
-    def apply_retarget(self, asset_id: str, plan_path: Path | str) -> tuple[str, dict[str, object]]:
-        report, prepared = self._prepare_retarget(asset_id, plan_path)
+    def apply_retarget(
+        self, asset_id: str, plan_path: Path | str, review_path: Path | str | None = None
+    ) -> tuple[str, dict[str, object]]:
+        report, prepared = self._prepare_retarget(asset_id, plan_path, review_path)
         if report["errors"]:
             raise ImportErrorBundle(list(report["errors"]))
         assert prepared is not None
@@ -149,8 +153,335 @@ class ResourceLibrary:
             raise KeyError(f"{asset_id} is not a retargeted asset")
         return record["base_asset_id"]
 
+    def save_tile_review(
+        self,
+        asset_id: str,
+        plan_path: Path | str,
+        review_path: Path | str,
+        choices: list[dict[str, object]] | None = None,
+        choices_path: Path | str | None = None,
+    ) -> dict[str, object]:
+        return self._write_tile_review(asset_id, plan_path, review_path, choices or [], None, choices_path)
+
+    def save_tile_review_as(
+        self,
+        asset_id: str,
+        plan_path: Path | str,
+        source_review_path: Path | str,
+        review_path: Path | str,
+        choices: list[dict[str, object]] | None = None,
+        choices_path: Path | str | None = None,
+    ) -> dict[str, object]:
+        return self._write_tile_review(asset_id, plan_path, review_path, choices or [], source_review_path, choices_path)
+
+    def _write_tile_review(
+        self,
+        asset_id: str,
+        plan_path: Path | str,
+        review_path: Path | str,
+        choices: list[dict[str, object]],
+        source_review_path: Path | str | None,
+        choices_path: Path | str | None = None,
+    ) -> dict[str, object]:
+        plan_path = Path(plan_path)
+        review_path = Path(review_path)
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ImportErrorBundle([f"{plan_path}: unreadable or invalid JSON: {exc}"]) from exc
+        if not isinstance(plan, dict) or not isinstance(plan.get("tile_updates"), list):
+            raise ImportErrorBundle([f"{plan_path}: plan must contain tile_updates"])
+        consumer: dict[str, object] = {}
+        source_review = None
+        if source_review_path is not None:
+            source_path = Path(source_review_path)
+            try:
+                source_review = json.loads(source_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ImportErrorBundle([f"{source_path}: unreadable or invalid review JSON: {exc}"]) from exc
+        if choices_path is not None:
+            try:
+                choices_data = json.loads(Path(choices_path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ImportErrorBundle([f"{choices_path}: unreadable or invalid review choices JSON: {exc}"]) from exc
+            if not isinstance(choices_data, list):
+                raise ImportErrorBundle([f"{choices_path}: review choices must be a list"])
+            choices = [*choices, *choices_data]
+        report, _ = self._prepare_tile_update(
+            asset_id, plan_path, plan, None, consumer
+        )
+        requests = consumer["requests"]
+        tiled = consumer["tiled"]
+        nodes = consumer["nodes"]
+        materials = consumer["materials"]
+        meshes = consumer["meshes"]
+        assert isinstance(requests, list)
+        assert isinstance(tiled, dict)
+        assert isinstance(nodes, dict)
+        existing_choices: dict[tuple[str, str, str], dict[str, object]] = {}
+        if source_review is not None:
+            if not isinstance(source_review, dict) or source_review.get("kind") != "tile_review":
+                raise ImportErrorBundle(["source is not a tile review record"])
+            for raw_choice in source_review.get("choices", []):
+                if isinstance(raw_choice, dict) and isinstance(raw_choice.get("candidate_id"), str) and isinstance(raw_choice.get("node_id"), str):
+                    tile_ids = raw_choice.get("tile_ids")
+                    if tile_ids is None and isinstance(raw_choice.get("tile_id"), str):
+                        tile_ids = [raw_choice["tile_id"]]
+                    if not isinstance(tile_ids, list):
+                        continue
+                    for tile_id in tile_ids:
+                        if isinstance(tile_id, str):
+                            existing_choices[(raw_choice["candidate_id"], raw_choice["node_id"], tile_id)] = dict(raw_choice)
+        for item in choices:
+            if not isinstance(item, dict) or not isinstance(item.get("candidate_id"), str) or not isinstance(item.get("node_id"), str):
+                continue
+            tile_ids = item.get("tile_ids", [])
+            if not isinstance(tile_ids, list):
+                continue
+            node_id = self._review_node_id(nodes, item["node_id"])
+            if node_id is None:
+                continue
+            request = next((request for request in requests if request["candidate_id"] == item["candidate_id"]), None)
+            if request is None:
+                continue
+            files = request["files"]
+            assert isinstance(files, dict)
+            status = item.get("status", "selected")
+            for tile_id in tile_ids:
+                if not isinstance(tile_id, str) or tile_id not in files:
+                    continue
+                file_info = files[tile_id]
+                if status == "selected":
+                    old_tiled = request["old_tiled"]
+                    assert isinstance(old_tiled, TiledTexture)
+                    for old_key, old_choice in existing_choices.items():
+                        if (
+                            old_key[1:] == (node_id, tile_id)
+                            and old_key[0] != item["candidate_id"]
+                            and old_choice.get("tiled_texture_id") == old_tiled.id()
+                            and old_choice.get("status") == "selected"
+                        ):
+                            old_choice["status"] = "superseded"
+                existing_choices[(item["candidate_id"], node_id, tile_id)] = {
+                    "candidate_id": item["candidate_id"],
+                    "node_id": node_id,
+                    "node_name": nodes[node_id].name,
+                    "tiled_texture_id": request["old_tiled"].id(),
+                    "tile_id": tile_id,
+                    "file": file_info["file"],
+                    "file_sha256": file_info["sha256"],
+                    "image_id": file_info["image_id"],
+                    "status": status,
+                    "needs_reconfirmation": False,
+                }
+        review = self._tile_review_snapshot(
+            asset_id, plan_path, requests, tiled, nodes, materials, meshes,
+            source_review if isinstance(source_review, dict) else {"asset_id": asset_id},
+            list(existing_choices.values()), set(), merge=True
+        )
+        review_path.parent.mkdir(parents=True, exist_ok=True)
+        review_path.write_text(
+            json.dumps(review, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return {
+            "review_path": str(review_path),
+            "asset_id": asset_id,
+            "plan": str(plan_path),
+            "valid": report["valid"],
+            "errors": report.get("errors", []),
+            "review": review,
+        }
+
+    @staticmethod
+    def _review_node_id(nodes: dict[str, object], wanted: str) -> str | None:
+        if wanted in nodes:
+            return wanted
+        matches = [oid for oid, node in nodes.items() if isinstance(node, Node) and (node.name == wanted or oid == wanted)]
+        return matches[0] if len(matches) == 1 else None
+
+    def _review_tile_available(
+        self,
+        choices: dict[tuple[str, str, str], dict[str, object]],
+        candidate_id: str,
+        node_id: str,
+        tile_id: str,
+    ) -> bool:
+        choice = choices.get((candidate_id, node_id, tile_id))
+        return choice is None or choice.get("status") != "deferred"
+
+    def _tile_review_snapshot(
+        self,
+        asset_id: str,
+        plan_path: Path,
+        requests: list[dict[str, object]],
+        tiled: dict[str, object],
+        nodes: dict[str, object],
+        materials: dict[str, object],
+        meshes: dict[str, object],
+        previous: dict[str, object] | None,
+        choices: dict[tuple[str, str, str], dict[str, object]] | list[dict[str, object]],
+        stale_keys: set[tuple[str, str, str]],
+        merge: bool = False,
+    ) -> dict[str, object]:
+        if isinstance(choices, list):
+            choice_map = {
+                (str(item.get("candidate_id")), str(item.get("node_id")), str(item.get("tile_id"))): item
+                for item in choices
+                if isinstance(item, dict)
+            }
+        else:
+            choice_map = dict(choices)
+        request_identity = {
+            (str(request["candidate_id"]), tile_id): file_info
+            for request in requests
+            for tile_id, file_info in request["files"].items()
+        }
+        for key, item in list(choice_map.items()):
+            current = request_identity.get((key[0], key[2]))
+            if current is not None and item.get("file_sha256") != current["sha256"]:
+                item["needs_reconfirmation"] = True
+                stale_keys.add(key)
+        candidates = []
+        for request in requests:
+            old_tiled = request["old_tiled"]
+            assert isinstance(old_tiled, TiledTexture)
+            files = request["files"]
+            assert isinstance(files, dict)
+            target_nodes = request.get("target_nodes")
+            candidate_node_ids = []
+            if request.get("withdraw"):
+                candidate_node_ids = sorted(target_nodes or set())
+            else:
+                consumers = {
+                    node_id for node_id, node in nodes.items()
+                    if isinstance(node, Node) and node.mesh_id in meshes
+                    and any(
+                        old_tiled.id() in materials[material_id].tiled_texture_ids.values()
+                        for material_id, _, _ in meshes[node.mesh_id].material_bindings
+                        if material_id in materials
+                    )
+                }
+                candidate_node_ids = sorted(consumers if target_nodes is None else set(target_nodes) & consumers)
+            candidates.append({
+                "candidate_id": request["candidate_id"],
+                "label": request["label"],
+                "priority": request["priority"],
+                "action": "withdraw" if request.get("withdraw") else "adopt",
+                "tiled_texture_id": old_tiled.id(),
+                "tiled_texture_name": old_tiled.name,
+                "usage": old_tiled.usage,
+                "node_ids": candidate_node_ids,
+                "node_names": [nodes[node_id].name for node_id in candidate_node_ids if isinstance(nodes.get(node_id), Node)],
+                "tiles": [
+                    {
+                        "tile_id": tile_id,
+                        "file": file_info["file"],
+                        "file_sha256": file_info["sha256"],
+                        "image_id": file_info["image_id"],
+                    }
+                    for tile_id, file_info in sorted(files.items())
+                ],
+            })
+        overlaps = []
+        requests_by_texture: dict[str, list[dict[str, object]]] = {}
+        for request in requests:
+            requests_by_texture.setdefault(request["old_tiled"].id(), []).append(request)
+        for old_texture_id, group in requests_by_texture.items():
+            old_tiled = tiled[old_texture_id]
+            assert isinstance(old_tiled, TiledTexture)
+            consumers = {
+                node_id for node_id, node in nodes.items()
+                if isinstance(node, Node) and node.mesh_id in meshes
+                and any(
+                    old_texture_id in materials[material_id].tiled_texture_ids.values()
+                    for material_id, _, _ in meshes[node.mesh_id].material_bindings
+                    if material_id in materials
+                )
+            }
+            for node_id in sorted(consumers):
+                for tile in old_tiled.tiles:
+                    offers = []
+                    for request in group:
+                        targets = request.get("target_nodes")
+                        if targets is not None and node_id not in targets:
+                            continue
+                        files = request["files"]
+                        assert isinstance(files, dict)
+                        if tile.tile_id in files and self._review_tile_available(choice_map, str(request["candidate_id"]), node_id, tile.tile_id):
+                            offers.append(request)
+                    selected = [
+                        request for request in offers
+                        if choice_map.get((str(request["candidate_id"]), node_id, tile.tile_id), {}).get("status") == "selected"
+                    ]
+                    image_ids = {request["files"][tile.tile_id]["image_id"] for request in offers}
+                    priority = max((request["priority"] for request in offers), default=0)
+                    resolved = len(selected) == 1 or len(image_ids) == 1
+                    if len(offers) > 1 and len(image_ids) > 1 and not resolved:
+                        overlaps.append({
+                            "tiled_texture_id": old_texture_id,
+                            "usage": old_tiled.usage,
+                            "node_id": node_id,
+                            "node_name": nodes[node_id].name,
+                            "tile_id": tile.tile_id,
+                            "candidate_ids": [str(request["candidate_id"]) for request in offers],
+                            "status": "pending",
+                        })
+        choice_items = []
+        for key in sorted(choice_map):
+            item = dict(choice_map[key])
+            if key in stale_keys:
+                item["needs_reconfirmation"] = True
+            choice_items.append(item)
+        pending_ranges = [item for item in choice_items if item.get("status") == "deferred"]
+        unresolved = [
+            overlap for overlap in overlaps
+            if not any(
+                item.get("status") == "selected"
+                and item.get("tiled_texture_id") == overlap["tiled_texture_id"]
+                and item.get("node_id") == overlap["node_id"]
+                and item.get("tile_id") == overlap["tile_id"]
+                for item in choice_items
+            )
+        ]
+        if isinstance(previous, dict) and isinstance(previous.get("unresolved_overlaps"), list):
+            unresolved_keys = {
+                (item.get("tiled_texture_id"), item.get("node_id"), item.get("tile_id"))
+                for item in unresolved
+            }
+            for item in previous["unresolved_overlaps"]:
+                if not isinstance(item, dict):
+                    continue
+                key = (item.get("tiled_texture_id"), item.get("node_id"), item.get("tile_id"))
+                if key in unresolved_keys:
+                    continue
+                if not any(
+                    choice.get("status") == "selected"
+                    and choice.get("tiled_texture_id") == item.get("tiled_texture_id")
+                    and choice.get("node_id") == item.get("node_id")
+                    and choice.get("tile_id") == item.get("tile_id")
+                    for choice in choice_items
+                ):
+                    unresolved.append(item)
+                    unresolved_keys.add(key)
+        return {
+            "kind": "tile_review",
+            "version": 1,
+            "asset_id": asset_id,
+            "plan_path": str(plan_path),
+            "candidates": candidates,
+            "overlaps": overlaps,
+            "unresolved_overlaps": unresolved,
+            "choices": choice_items,
+            "deferred_ranges": pending_ranges,
+            "published": False,
+        }
+
     def _prepare_retarget(
-        self, asset_id: str, plan_path: Path | str
+        self,
+        asset_id: str,
+        plan_path: Path | str,
+        review_path: Path | str | None = None,
     ) -> tuple[dict[str, object], tuple[Asset, dict[str, object], dict[str, object]] | None]:
         plan_path = Path(plan_path)
         try:
@@ -162,7 +493,7 @@ class ResourceLibrary:
         if "tile_updates" in plan:
             if not isinstance(plan["tile_updates"], list) or "replacements" in plan:
                 raise ImportErrorBundle([f"{plan_path}: tile_updates must be a list and cannot be combined with replacements"])
-            return self._prepare_tile_update(asset_id, plan_path, plan)
+            return self._prepare_tile_update(asset_id, plan_path, plan, review_path)
         if not isinstance(plan.get("replacements"), list):
             raise ImportErrorBundle([f"{plan_path}: plan must contain replacements or tile_updates"])
 
@@ -434,7 +765,12 @@ class ResourceLibrary:
         return report, (new_asset, new_objects, record)
 
     def _prepare_tile_update(
-        self, asset_id: str, plan_path: Path, plan: dict[str, object]
+        self,
+        asset_id: str,
+        plan_path: Path,
+        plan: dict[str, object],
+        review_path: Path | str | None = None,
+        review_consumer: dict[str, object] | None = None,
     ) -> tuple[dict[str, object], tuple[Asset, dict[str, object], dict[str, object]] | None]:
         closure = self._closure(asset_id)
         images = {oid: obj for oid, obj in closure.items() if isinstance(obj, Image)}
@@ -461,6 +797,7 @@ class ResourceLibrary:
         assert isinstance(raw_updates, list)
         for position, entry in enumerate(raw_updates):
             label = f"tile_updates[{position}]"
+            candidate_id = f"candidate-{position}"
             if not isinstance(entry, dict):
                 errors.append(f"{label}: entry must be an object")
                 continue
@@ -485,11 +822,13 @@ class ResourceLibrary:
                     target_nodes.update(matches)
                 requests.append({
                     "label": label,
+                    "candidate_id": candidate_id,
                     "old_tiled": tiled[texture_id],
                     "requested": {},
                     "target_nodes": target_nodes,
                     "withdraw": True,
                     "priority": priority,
+                    "files": {},
                 })
                 continue
             old_tiled = tiled[texture_id]
@@ -502,7 +841,8 @@ class ResourceLibrary:
             if not isinstance(raw_tiles, dict):
                 errors.append(f"{label}: tiles 必须是以分片 ID 为键的对象")
                 continue
-            requested: dict[str, TextureTile] = {}
+            requested: dict[str, object] = {}
+            files: dict[str, dict[str, object]] = {}
             explicit_tiles = 0
             for tile_id, tile_spec in raw_tiles.items():
                 tile_label = f"{label}.tiles[{tile_id}]"
@@ -513,6 +853,7 @@ class ResourceLibrary:
                 if tile_spec is None:
                     explicit_tiles += 1
                     requested[tile_id] = old_tile
+                    files[tile_id] = {"file": None, "sha256": sha256_bytes(images[old_tile.image_id].payload), "image_id": old_tile.image_id}
                     continue
                 if not isinstance(tile_spec, dict) or not isinstance(tile_spec.get("file"), str):
                     errors.append(f"{tile_label}: 图像缺失: 未提供替换文件")
@@ -545,6 +886,7 @@ class ResourceLibrary:
                     continue
                 image = Image(f"{old_image.name}#{tile_id}@{new_width}x{new_height}", mime_type, payload)
                 explicit_tiles += 1
+                files[tile_id] = {"file": tile_spec["file"], "sha256": sha256_bytes(payload), "image_id": image.id()}
                 requested[tile_id] = TextureTile(
                     tile_id, old_tile.x, old_tile.y, old_tile.width, old_tile.height,
                     image.id(), old_tile.tile_id, old_tile.image_id, old_tile.source_texture_id or old_tiled.id(),
@@ -564,14 +906,82 @@ class ResourceLibrary:
                     target_nodes.update(matches)
             requests.append({
                 "label": label,
+                "candidate_id": candidate_id,
                 "old_tiled": old_tiled,
                 "requested": requested,
                 "target_nodes": target_nodes,
                 "explicit_tiles": explicit_tiles,
                 "priority": priority,
+                "files": files,
             })
+
+        review = None
+        review_choices: dict[tuple[str, str, str], dict[str, object]] = {}
+        stale_choice_keys: set[tuple[str, str, str]] = set()
+        if review_consumer is not None:
+            review_consumer.update({
+                "requests": requests,
+                "tiled": tiled,
+                "nodes": nodes,
+                "materials": materials,
+                "meshes": meshes,
+            })
+        if review_path is not None:
+            review_path = Path(review_path)
+            try:
+                review = json.loads(review_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                errors.append(f"{review_path}: 审阅记录无法读取或不是有效 JSON: {exc}")
+            if not isinstance(review, dict) or review.get("kind") != "tile_review":
+                errors.append(f"{review_path}: 不是分片更新审阅记录")
+            elif review.get("asset_id") != asset_id:
+                errors.append(f"{review_path}: 审阅记录属于其他资产")
+            else:
+                raw_choices = review.get("choices", [])
+                if not isinstance(raw_choices, list):
+                    errors.append(f"{review_path}: choices 必须是列表")
+                    raw_choices = []
+                requests_by_id = {str(request["candidate_id"]): request for request in requests}
+                for raw_choice in raw_choices:
+                    if not isinstance(raw_choice, dict):
+                        errors.append(f"{review_path}: 审阅选择必须是对象")
+                        continue
+                    candidate_id = raw_choice.get("candidate_id")
+                    node_id = raw_choice.get("node_id")
+                    request = requests_by_id.get(str(candidate_id)) if isinstance(candidate_id, str) else None
+                    if request is None or not isinstance(node_id, str):
+                        continue
+                    tile_ids = raw_choice.get("tile_ids")
+                    if tile_ids is None and isinstance(raw_choice.get("tile_id"), str):
+                        tile_ids = [raw_choice["tile_id"]]
+                    if not isinstance(tile_ids, list):
+                        errors.append(f"{review_path}: 审阅选择的 tile_ids 必须是列表")
+                        continue
+                    files = request["files"]
+                    assert isinstance(files, dict)
+                    for tile_id in tile_ids:
+                        if not isinstance(tile_id, str) or tile_id not in files:
+                            continue
+                        current = files[tile_id]
+                        saved_hash = raw_choice.get("file_sha256")
+                        choice = dict(raw_choice)
+                        key = (str(candidate_id), node_id, tile_id)
+                        if saved_hash != current["sha256"]:
+                            choice["needs_reconfirmation"] = True
+                            stale_choice_keys.add(key)
+                        review_choices[key] = choice
         if errors:
-            return {"asset_id": asset_id, "valid": False, "errors": errors, "changes": [], "missing_areas": []}, None
+            return {
+                "asset_id": asset_id,
+                "valid": False,
+                "errors": errors,
+                "changes": [],
+                "missing_areas": [],
+                "review": self._tile_review_snapshot(
+                    asset_id, plan_path, requests, tiled, nodes, materials, meshes,
+                    review, review_choices, stale_choice_keys
+                ),
+            }, None
 
         new_objects: dict[str, object] = {}
         # (node_id, old_tiled_texture_id) -> replacement tiled texture id
@@ -661,6 +1071,23 @@ class ResourceLibrary:
                 targets = request["target_nodes"]
                 assert targets is None or isinstance(targets, set)
                 effective.append((request, set(consumer_nodes) if targets is None else set(targets) & set(consumer_nodes)))
+            for request, _target_set in effective:
+                candidate_id = str(request["candidate_id"])
+                stale = [
+                    key for key, choice in review_choices.items()
+                    if key[0] == candidate_id and choice.get("status") == "selected"
+                    and choice.get("needs_reconfirmation")
+                    and not any(
+                        other_key != key and other_choice.get("status") == "selected"
+                        and other_key[1:] == key[1:]
+                        and not other_choice.get("needs_reconfirmation")
+                        for other_key, other_choice in review_choices.items()
+                    )
+                ]
+                if stale:
+                    errors.append(f"{request['label']}: 候选文件已变化，请重新确认审阅选择")
+            if errors:
+                continue
             adopted_by_candidate: dict[int, dict[str, list[str]]] = {}
             node_choice: dict[str, dict[str, tuple[TextureTile, Image | None]]] = {}
             for node_id in consumer_nodes:
@@ -678,8 +1105,28 @@ class ResourceLibrary:
                         (index, request) for index, request in applicable
                         if old_tile.tile_id in request["requested"]
                     ]
+                    offers = [
+                        (index, request) for index, request in offers
+                        if self._review_tile_available(
+                            review_choices, str(request["candidate_id"]), node_id, old_tile.tile_id
+                        )
+                    ]
                     if not offers:
                         continue
+                    selected_offers = [
+                        (index, request) for index, request in offers
+                        if review_choices.get(
+                            (str(request["candidate_id"]), node_id, old_tile.tile_id), {}
+                        ).get("status") == "selected"
+                    ]
+                    if len(selected_offers) > 1:
+                        errors.append(
+                            f"{old_tiled.name}: 分片 {old_tile.tile_id!r} 对节点 {nodes[node_id].name!r} 选择了多个候选"
+                        )
+                        overlapped = True
+                        break
+                    if selected_offers:
+                        offers = selected_offers
                     distinct_images = {
                         request["requested"][old_tile.tile_id].image_id for _, request in offers
                     }
@@ -805,7 +1252,17 @@ class ResourceLibrary:
                     ],
                 })
         if errors:
-            return {"asset_id": asset_id, "valid": False, "errors": errors, "changes": [], "missing_areas": []}, None
+            return {
+                "asset_id": asset_id,
+                "valid": False,
+                "errors": errors,
+                "changes": [],
+                "missing_areas": [],
+                "review": self._tile_review_snapshot(
+                    asset_id, plan_path, requests, tiled, nodes, materials, meshes,
+                    review, review_choices, stale_choice_keys
+                ),
+            }, None
 
         material_cache: dict[tuple[str, tuple[tuple[str, str], ...]], str] = {}
 
@@ -932,6 +1389,10 @@ class ResourceLibrary:
             "missing_areas": missing_areas,
             "tile_updates": summaries,
             "candidates": candidate_reports,
+            "review": self._tile_review_snapshot(
+                asset_id, plan_path, requests, tiled, nodes, materials, meshes,
+                review, review_choices, stale_choice_keys
+            ),
             "new_asset_id": new_asset.id(),
         }
         record = {

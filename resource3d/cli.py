@@ -26,8 +26,17 @@ def main(argv: list[str] | None = None) -> int:
     retarget_parser.add_argument("--library", required=True)
     retarget_parser.add_argument("--asset", required=True)
     retarget_parser.add_argument("--plan", required=True)
+    retarget_parser.add_argument("--review")
     retarget_parser.add_argument("--commit", action="store_true")
     retarget_parser.add_argument("--output")
+    review_parser = subparsers.add_parser("tile-review-save")
+    review_parser.add_argument("--library", required=True)
+    review_parser.add_argument("--asset", required=True)
+    review_parser.add_argument("--plan", required=True)
+    review_parser.add_argument("--review", required=True)
+    review_parser.add_argument("--choices")
+    review_parser.add_argument("--from-review")
+    review_parser.add_argument("--output")
     rollback_parser = subparsers.add_parser("rollback")
     rollback_parser.add_argument("--library", required=True)
     rollback_parser.add_argument("--asset", required=True)
@@ -40,10 +49,26 @@ def main(argv: list[str] | None = None) -> int:
             print(library.export_inspection(args.asset, args.output))
         elif args.command == "retarget":
             if args.commit:
-                _, report = library.apply_retarget(args.asset, args.plan)
+                _, report = library.apply_retarget(args.asset, args.plan, args.review)
             else:
-                report = library.plan_retarget(args.asset, args.plan)
+                report = library.plan_retarget(args.asset, args.plan, args.review)
             payload = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            if args.output:
+                with open(args.output, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                print(args.output)
+            else:
+                print(payload, end="")
+        elif args.command == "tile-review-save":
+            if args.from_review:
+                result = library.save_tile_review_as(
+                    args.asset, args.plan, args.from_review, args.review, choices_path=args.choices
+                )
+            else:
+                result = library.save_tile_review(
+                    args.asset, args.plan, args.review, choices_path=args.choices
+                )
+            payload = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
             if args.output:
                 with open(args.output, "w", encoding="utf-8") as handle:
                     handle.write(payload)
