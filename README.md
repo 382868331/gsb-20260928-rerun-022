@@ -114,6 +114,26 @@ python3 -m resource3d.cli rollback --library build/library --asset "$NEW_ASSET"
 - 撤回时使用 `{"withdraw": true, "tiled_texture": "...", "nodes": [...]}`，系统从该版各片的 `source_texture_id/source_tile_id/source_image_id` 恢复来源版本，并只为被选节点生成旧组合材质。
 - 预演失败或提交异常时保留既有资产和索引；同一计划重复提交仍得到同一资产 ID，不会发布来源不明的半成品。
 
+### 并行候选与组合采用
+
+同一分片贴图可以在一次 `tile_updates` 中登记多个候选条目，系统并行比较后按对象组合采用，而不是按登记顺序后者覆盖前者：
+
+```json
+{
+  "tile_updates": [
+    {"tiled_texture": "character-color", "tiles": {"head": {"file": "head-a.png"}}, "nodes": ["hero"]},
+    {"tiled_texture": "character-color", "priority": 1, "tiles": {"head": {"file": "head-b.png"}}, "nodes": ["hero"]},
+    {"tiled_texture": "character-color", "tiles": {"body": {"file": "body-npc.png"}}, "nodes": ["npc"]}
+  ]
+}
+```
+
+- 候选作用于不同对象时各自组合：每个对象按自己命中的候选得到新的 `ttx_` 组合，结果相同的对象共享同一内容寻址身份，未命中任何候选的对象保持旧引用不变。
+- 两个候选在同一对象上覆盖同一分片位置且内容不同时构成重叠，必须用明确的 `priority`（整数，大者胜出）解决；缺省或并列时整批拒绝，绝不按最后登记顺序静默覆盖。
+- 预演报告中的 `candidates` 逐项列出每个候选的目标对象、每片 `adopted/superseded` 状态与实际采用节点，`base_asset_id` 与 `affected_nodes` 给出原资产与实际影响对象；`changes` 只包含真正被改写的对象。
+- 失效候选（文件缺失、尺寸或用途不合法）导致整批拒绝，其文件不会进入对象库；同名同尺寸但内容不同的文件按内容寻址生成不同 `img_`，失效或落选候选不能借用同名同尺寸文件的身份。
+- 重复采用同一组合或重复同一撤回都得到同一资产 ID，索引不增加重复资产；撤回某个对象的采用后，其他对象的候选版本保持不变，已发布资产始终可完整导出。
+
 ## 快速开始
 
 ```bash

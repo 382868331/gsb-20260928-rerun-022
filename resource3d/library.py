@@ -457,7 +457,6 @@ class ResourceLibrary:
 
         errors: list[str] = []
         requests: list[dict[str, object]] = []
-        seen_tiled_textures: set[str] = set()
         raw_updates = plan["tile_updates"]
         assert isinstance(raw_updates, list)
         for position, entry in enumerate(raw_updates):
@@ -469,10 +468,10 @@ class ResourceLibrary:
             if texture_id is None:
                 errors.append(f"{label}: 图像缺失: 资产中找不到分片贴图 {entry.get('tiled_texture')!r}")
                 continue
-            if texture_id in seen_tiled_textures:
-                errors.append(f"{label}: 同一分片贴图在一次更新中出现了多个互相冲突的条目")
+            priority = entry.get("priority", 0)
+            if not isinstance(priority, int) or isinstance(priority, bool):
+                errors.append(f"{label}: priority 必须是整数")
                 continue
-            seen_tiled_textures.add(texture_id)
             if entry.get("withdraw") is True:
                 node_filter = entry.get("nodes")
                 if not isinstance(node_filter, list) or not node_filter:
@@ -490,6 +489,7 @@ class ResourceLibrary:
                     "requested": {},
                     "target_nodes": target_nodes,
                     "withdraw": True,
+                    "priority": priority,
                 })
                 continue
             old_tiled = tiled[texture_id]
@@ -568,26 +568,44 @@ class ResourceLibrary:
                 "requested": requested,
                 "target_nodes": target_nodes,
                 "explicit_tiles": explicit_tiles,
+                "priority": priority,
             })
         if errors:
             return {"asset_id": asset_id, "valid": False, "errors": errors, "changes": [], "missing_areas": []}, None
 
         new_objects: dict[str, object] = {}
-        updates_by_old_texture: dict[str, dict[str, object]] = {}
+        # (node_id, old_tiled_texture_id) -> replacement tiled texture id
+        node_texture_override: dict[tuple[str, str], str] = {}
         summaries: list[dict[str, object]] = []
+        candidate_reports: list[dict[str, object]] = []
+        requests_by_texture: dict[str, list[dict[str, object]]] = {}
         for request in requests:
-            old_tiled = request["old_tiled"]
-            assert isinstance(old_tiled, TiledTexture)
-            if request.get("withdraw"):
+            grouped_old = request["old_tiled"]
+            assert isinstance(grouped_old, TiledTexture)
+            requests_by_texture.setdefault(grouped_old.id(), []).append(request)
+
+        for old_texture_id, group in requests_by_texture.items():
+            old_tiled = tiled[old_texture_id]
+            withdraws = [request for request in group if request.get("withdraw")]
+            if withdraws:
+                if len(group) > 1:
+                    errors.append(f"{withdraws[0]['label']}: 撤回不能与其他候选同时作用于同一分片贴图")
+                    continue
+                request = withdraws[0]
                 source_refs = {tile.source_texture_id for tile in old_tiled.tiles if tile.source_texture_id}
-                if len(source_refs) != 1 or not source_refs.intersection(tiled):
+                if len(source_refs) != 1:
                     errors.append(f"{request['label']}: 无法从来源记录恢复原始分片贴图")
                     continue
                 original_id = next(iter(source_refs))
-                updates_by_old_texture[old_tiled.id()] = {
-                    "new": tiled[original_id],
-                    "request": request,
-                }
+                try:
+                    source_texture = self.load_object(original_id)
+                except KeyError:
+                    source_texture = None
+                if not isinstance(source_texture, TiledTexture):
+                    errors.append(f"{request['label']}: 无法从来源记录恢复原始分片贴图")
+                    continue
+                for node_id in sorted(request["target_nodes"]):
+                    node_texture_override[(node_id, old_texture_id)] = original_id
                 summaries.append({
                     "old_tiled_texture_id": old_tiled.id(),
                     "new_tiled_texture_id": original_id,
@@ -613,86 +631,194 @@ class ResourceLibrary:
                     "edges": self._tile_edges(old_tiled),
                     "action": "withdraw",
                 })
+                candidate_reports.append({
+                    "label": request["label"],
+                    "tiled_texture_id": old_tiled.id(),
+                    "action": "withdraw",
+                    "priority": request["priority"],
+                    "nodes": sorted(request["target_nodes"]),
+                    "tiles": [],
+                })
                 continue
-            requested = request["requested"]
-            assert isinstance(requested, dict)
-            if request.get("explicit_tiles", 0) == 0:
-                errors.append(f"{request['label']}: 没有任何分片发生变化")
+            for request in group:
+                if request.get("explicit_tiles", 0) == 0:
+                    errors.append(f"{request['label']}: 没有任何分片发生变化")
+            if errors:
                 continue
-            new_tiles = []
-            tile_summary = []
-            retained = []
-            for old_tile in old_tiled.tiles:
-                if old_tile.tile_id in requested:
-                    tile = requested[old_tile.tile_id]
-                    image = requested[old_tile.tile_id + "__image"]
-                    assert isinstance(image, Image)
-                    new_objects[image.id()] = image
-                    tile_summary.append({
-                        "tile_id": tile.tile_id,
-                        "x": tile.x,
-                        "y": tile.y,
-                        "width": tile.width,
-                        "height": tile.height,
-                        "old_image_id": old_tile.image_id,
-                        "new_image_id": tile.image_id,
-                        "old_size": [tile.width, tile.height],
-                        "new_size": [image_dimensions(image.mime_type, image.payload)[0], image_dimensions(image.mime_type, image.payload)[1]],
-                        "state": "updated",
-                    })
-                else:
-                    tile = TextureTile(
-                        old_tile.tile_id, old_tile.x, old_tile.y, old_tile.width, old_tile.height,
-                        old_tile.image_id,
-                        old_tile.source_tile_id or old_tile.tile_id,
-                        old_tile.source_image_id or old_tile.image_id,
-                        old_tile.source_texture_id or old_tiled.id(),
-                    )
-                    retained.append(old_tile.tile_id)
-                    tile_summary.append({
-                        "tile_id": tile.tile_id,
-                        "x": tile.x,
-                        "y": tile.y,
-                        "width": tile.width,
-                        "height": tile.height,
-                        "image_id": old_tile.image_id,
-                        "state": "retained",
-                    })
-                new_tiles.append(tile)
-            new_tiled = TiledTexture(
-                f"{old_tiled.name}#partial", old_tiled.usage, tuple(new_tiles),
-                old_tiled.atlas_width, old_tiled.atlas_height, old_tiled.tex_coord,
+            consumer_nodes = sorted(
+                node_id
+                for node_id, node in nodes.items()
+                if node.mesh_id in meshes
+                and any(
+                    old_texture_id in materials[material_id].tiled_texture_ids.values()
+                    for material_id, _, _ in meshes[node.mesh_id].material_bindings
+                    if material_id in materials
+                )
             )
-            if all(tile.image_id == old_tiled.tiles[index].image_id for index, tile in enumerate(new_tiles)):
-                errors.append(f"{request['label']}: 没有任何分片发生变化")
+            # 并行候选：每个候选声明自己影响的对象集合，缺省为所有引用该贴图的对象
+            effective: list[tuple[dict[str, object], set[str]]] = []
+            for request in group:
+                targets = request["target_nodes"]
+                assert targets is None or isinstance(targets, set)
+                effective.append((request, set(consumer_nodes) if targets is None else set(targets) & set(consumer_nodes)))
+            adopted_by_candidate: dict[int, dict[str, list[str]]] = {}
+            node_choice: dict[str, dict[str, tuple[TextureTile, Image | None]]] = {}
+            for node_id in consumer_nodes:
+                applicable = [
+                    (index, request)
+                    for index, (request, target_set) in enumerate(effective)
+                    if node_id in target_set
+                ]
+                if not applicable:
+                    continue
+                chosen: dict[str, tuple[TextureTile, Image | None]] = {}
+                overlapped = False
+                for old_tile in old_tiled.tiles:
+                    offers = [
+                        (index, request) for index, request in applicable
+                        if old_tile.tile_id in request["requested"]
+                    ]
+                    if not offers:
+                        continue
+                    distinct_images = {
+                        request["requested"][old_tile.tile_id].image_id for _, request in offers
+                    }
+                    if len(distinct_images) > 1:
+                        best = max(request["priority"] for _, request in offers)
+                        winners = [(index, request) for index, request in offers if request["priority"] == best]
+                        if len(winners) != 1:
+                            errors.append(
+                                f"{old_tiled.name}: 分片 {old_tile.tile_id!r} 在同一位置有多个候选重叠，"
+                                "需要用明确的 priority 解决"
+                            )
+                            overlapped = True
+                            break
+                        offers = winners
+                    index, request = offers[0]
+                    requested = request["requested"]
+                    assert isinstance(requested, dict)
+                    tile = requested[old_tile.tile_id]
+                    assert isinstance(tile, TextureTile)
+                    image = requested.get(old_tile.tile_id + "__image")
+                    chosen[old_tile.tile_id] = (tile, image if isinstance(image, Image) else None)
+                    adopted_by_candidate.setdefault(index, {}).setdefault(old_tile.tile_id, []).append(node_id)
+                if overlapped:
+                    break
+                if chosen:
+                    node_choice[node_id] = chosen
+            if errors:
                 continue
-            new_objects[new_tiled.id()] = new_tiled
-            updates_by_old_texture[old_tiled.id()] = {"new": new_tiled, "request": request}
-            summaries.append({
-                "old_tiled_texture_id": old_tiled.id(),
-                "new_tiled_texture_id": new_tiled.id(),
-                "usage": old_tiled.usage,
-                "atlas_size": [old_tiled.atlas_width, old_tiled.atlas_height],
-                "nodes": sorted(request["target_nodes"]) if request["target_nodes"] is not None else None,
-                "tiles": tile_summary,
-                "retained_tile_ids": retained,
-                "edges": self._tile_edges(new_tiled),
-                "action": "adopt",
-            })
+            # 组合采用：结果相同的对象共享同一个新分片贴图身份，不同对象可分别保持旧引用
+            combos: dict[tuple[tuple[str, str], ...], dict[str, object]] = {}
+            for node_id, chosen in node_choice.items():
+                key = tuple(sorted((tile_id, tile.image_id) for tile_id, (tile, _) in chosen.items()))
+                combo = combos.setdefault(key, {"chosen": chosen, "nodes": []})
+                combo["nodes"].append(node_id)
+            produced = 0
+            for combo in combos.values():
+                chosen = combo["chosen"]
+                assert isinstance(chosen, dict)
+                new_tiles = []
+                tile_summary = []
+                retained = []
+                changed = False
+                for old_tile in old_tiled.tiles:
+                    if old_tile.tile_id in chosen:
+                        tile, image = chosen[old_tile.tile_id]
+                        if image is not None:
+                            new_objects[image.id()] = image
+                        if tile.image_id != old_tile.image_id:
+                            changed = True
+                        tile_summary.append({
+                            "tile_id": tile.tile_id,
+                            "x": tile.x,
+                            "y": tile.y,
+                            "width": tile.width,
+                            "height": tile.height,
+                            "old_image_id": old_tile.image_id,
+                            "new_image_id": tile.image_id,
+                            "old_size": [old_tile.width, old_tile.height],
+                            "new_size": list(image_dimensions(image.mime_type, image.payload)) if image is not None else [tile.width, tile.height],
+                            "state": "updated",
+                        })
+                    else:
+                        tile = TextureTile(
+                            old_tile.tile_id, old_tile.x, old_tile.y, old_tile.width, old_tile.height,
+                            old_tile.image_id,
+                            old_tile.source_tile_id or old_tile.tile_id,
+                            old_tile.source_image_id or old_tile.image_id,
+                            old_tile.source_texture_id or old_tiled.id(),
+                        )
+                        retained.append(old_tile.tile_id)
+                        tile_summary.append({
+                            "tile_id": tile.tile_id,
+                            "x": tile.x,
+                            "y": tile.y,
+                            "width": tile.width,
+                            "height": tile.height,
+                            "image_id": old_tile.image_id,
+                            "state": "retained",
+                        })
+                    new_tiles.append(tile)
+                if not changed:
+                    continue
+                new_tiled = TiledTexture(
+                    f"{old_tiled.name}#partial", old_tiled.usage, tuple(new_tiles),
+                    old_tiled.atlas_width, old_tiled.atlas_height, old_tiled.tex_coord,
+                )
+                new_objects[new_tiled.id()] = new_tiled
+                for node_id in combo["nodes"]:
+                    node_texture_override[(node_id, old_texture_id)] = new_tiled.id()
+                summaries.append({
+                    "old_tiled_texture_id": old_tiled.id(),
+                    "new_tiled_texture_id": new_tiled.id(),
+                    "usage": old_tiled.usage,
+                    "atlas_size": [old_tiled.atlas_width, old_tiled.atlas_height],
+                    "nodes": sorted(combo["nodes"]),
+                    "tiles": tile_summary,
+                    "retained_tile_ids": retained,
+                    "edges": self._tile_edges(new_tiled),
+                    "action": "adopt",
+                })
+                produced += 1
+            if produced == 0:
+                errors.append(f"{group[0]['label']}: 没有任何分片发生变化")
+                continue
+            for index, (request, target_set) in enumerate(effective):
+                requested = request["requested"]
+                assert isinstance(requested, dict)
+                adopted = adopted_by_candidate.get(index, {})
+                candidate_reports.append({
+                    "label": request["label"],
+                    "tiled_texture_id": old_tiled.id(),
+                    "action": "adopt",
+                    "priority": request["priority"],
+                    "nodes": sorted(target_set),
+                    "tiles": [
+                        {
+                            "tile_id": tile_id,
+                            "image_id": requested[tile_id].image_id,
+                            "state": "adopted" if tile_id in adopted else "superseded",
+                            "adopted_nodes": sorted(adopted.get(tile_id, [])),
+                        }
+                        for tile_id in sorted(key for key in requested if not key.endswith("__image"))
+                    ],
+                })
         if errors:
             return {"asset_id": asset_id, "valid": False, "errors": errors, "changes": [], "missing_areas": []}, None
 
-        material_cache: dict[tuple[str, frozenset[str]], str] = {}
+        material_cache: dict[tuple[str, tuple[tuple[str, str], ...]], str] = {}
 
-        def material_for(material_id: str, adopted_texture_ids: frozenset[str]) -> str:
-            key = (material_id, adopted_texture_ids)
+        def material_for(material_id: str, mapping: tuple[tuple[str, str], ...]) -> str:
+            key = (material_id, mapping)
             if key in material_cache:
                 return material_cache[key]
             material = materials[material_id]
             tiled_maps = dict(material.tiled_texture_ids)
+            replacements = dict(mapping)
             for usage, tiled_id in list(tiled_maps.items()):
-                if tiled_id in adopted_texture_ids:
-                    tiled_maps[usage] = updates_by_old_texture[tiled_id]["new"].id()
+                if tiled_id in replacements:
+                    tiled_maps[usage] = replacements[tiled_id]
             updated = replace(material, tiled_texture_ids=tiled_maps)
             if updated.id() != material_id:
                 new_objects[updated.id()] = updated
@@ -705,36 +831,38 @@ class ResourceLibrary:
             if not node.mesh_id or node.mesh_id not in meshes:
                 continue
             mesh = meshes[node.mesh_id]
-            applicable: dict[str, dict[str, object]] = {}
+            applicable: dict[str, str] = {}
             for material_id, _, _ in mesh.material_bindings:
                 material = materials.get(material_id)
                 if material is None:
                     continue
                 for usage, old_tiled_id in material.tiled_texture_ids.items():
-                    update = updates_by_old_texture.get(old_tiled_id)
-                    if update is None:
-                        continue
-                    targets = update["request"]["target_nodes"]
-                    if targets is None or node_id in targets:
-                        applicable[old_tiled_id] = update
+                    new_tiled_id = node_texture_override.get((node_id, old_tiled_id))
+                    if new_tiled_id is not None:
+                        applicable[old_tiled_id] = new_tiled_id
             if not applicable:
                 continue
             new_bindings = []
             for material_id, offset, count in mesh.material_bindings:
                 material = materials[material_id]
                 chosen = material_id
-                material_applicable = frozenset(
-                    old_tiled_id for old_tiled_id in material.tiled_texture_ids.values()
+                material_mapping = tuple(sorted(
+                    (old_tiled_id, applicable[old_tiled_id])
+                    for old_tiled_id in material.tiled_texture_ids.values()
                     if old_tiled_id in applicable
-                )
-                if material_applicable:
-                    chosen = material_for(material_id, material_applicable)
+                ))
+                if material_mapping:
+                    chosen = material_for(material_id, material_mapping)
                     chosen_material = materials.get(chosen) or new_objects[chosen]
                     assert isinstance(chosen_material, Material)
                     for usage, old_tex_id in material.tiled_texture_ids.items():
                         new_tex_id = chosen_material.tiled_texture_ids.get(usage)
-                        if old_tex_id in material_applicable and new_tex_id:
-                            update_summary = next(item for item in summaries if item["old_tiled_texture_id"] == old_tex_id)
+                        if old_tex_id in applicable and new_tex_id:
+                            update_summary = next(
+                                item for item in summaries
+                                if item["old_tiled_texture_id"] == old_tex_id
+                                and item["new_tiled_texture_id"] == new_tex_id
+                            )
                             changes.append({
                                 "node_id": node_id,
                                 "node_name": node.name,
@@ -796,16 +924,20 @@ class ResourceLibrary:
         ]
         report = {
             "asset_id": asset_id,
+            "base_asset_id": asset_id,
             "valid": True,
             "errors": [],
             "changes": sorted(changes, key=lambda item: (item["node_id"], item["usage"])),
+            "affected_nodes": sorted({change["node_id"] for change in changes}),
             "missing_areas": missing_areas,
             "tile_updates": summaries,
+            "candidates": candidate_reports,
             "new_asset_id": new_asset.id(),
         }
         record = {
             "plan": f"tile-retarget:{plan_path.name}",
             "tile_updates": summaries,
+            "candidates": candidate_reports,
         }
         return report, (new_asset, new_objects, record)
 

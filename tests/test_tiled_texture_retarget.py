@@ -258,5 +258,162 @@ class TiledTextureRetargetTests(unittest.TestCase):
         )
 
 
+    def write_plan(self, name: str, updates: list) -> Path:
+        plan = self.batch / name
+        plan.write_text(json.dumps({"tile_updates": updates}))
+        return plan
+
+    def color_texture_id(self, objects: dict, node_name: str) -> str:
+        node = next(item for item in objects.values() if item.get("name") == node_name)
+        mesh = objects[node["mesh_id"]]
+        material = objects[mesh["material_bindings"][0]["material_id"]]
+        return material["tiled_texture_ids"]["color"]
+
+    def test_parallel_candidates_combine_per_object(self) -> None:
+        (self.batch / "c1.png").write_bytes(png(1, 1, 3))
+        (self.batch / "c2.png").write_bytes(png(1, 1, 5))
+        plan = self.write_plan("parallel.json", [
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c1.png"}}, "nodes": ["object-a"]},
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c2.png"}}, "nodes": ["object-b"]},
+        ])
+        preview = self.library.plan_retarget(self.asset_id, plan)
+        self.assertTrue(preview["valid"], preview["errors"])
+        self.assertEqual(preview["base_asset_id"], self.asset_id)
+        self.assertEqual({change["node_name"] for change in preview["changes"]}, {"object-a", "object-b"})
+        candidates = [item for item in preview["candidates"] if item["action"] == "adopt"]
+        self.assertEqual(len(candidates), 2)
+        for candidate in candidates:
+            self.assertEqual(candidate["tiles"][0]["state"], "adopted")
+            self.assertEqual(len(candidate["tiles"][0]["adopted_nodes"]), 1)
+
+        new_asset, _ = self.library.apply_retarget(self.asset_id, plan)
+        new_objects = self.objects(new_asset)
+        old_objects = self.objects(self.asset_id)
+        old_color = next(oid for oid, item in old_objects.items() if item.get("name") == "atlas-color")
+        color_a = self.color_texture_id(new_objects, "object-a")
+        color_b = self.color_texture_id(new_objects, "object-b")
+        self.assertNotEqual(color_a, color_b)
+        self.assertNotEqual(color_a, old_color)
+        self.assertNotEqual(color_b, old_color)
+        # 每个对象只换自己的 left 片，right 片沿用旧图
+        for texture_id in (color_a, color_b):
+            tiles = {tile["tile_id"]: tile for tile in new_objects[texture_id]["tiles"]}
+            old_tiles = {tile["tile_id"]: tile for tile in old_objects[old_color]["tiles"]}
+            self.assertEqual(tiles["right"]["image_id"], old_tiles["right"]["image_id"])
+            self.assertNotEqual(tiles["left"]["image_id"], old_tiles["left"]["image_id"])
+        left_a = next(t["image_id"] for t in new_objects[color_a]["tiles"] if t["tile_id"] == "left")
+        left_b = next(t["image_id"] for t in new_objects[color_b]["tiles"] if t["tile_id"] == "left")
+        self.assertNotEqual(left_a, left_b)
+        # 重复采用得到同一资产，不增加重复资产
+        again, _ = self.library.apply_retarget(self.asset_id, plan)
+        self.assertEqual(again, new_asset)
+        self.assertEqual(
+            len(json.loads(self.library.index_path.read_text())["assets"]),
+            2,
+        )
+
+    def test_overlapping_candidates_need_explicit_resolution(self) -> None:
+        (self.batch / "c1.png").write_bytes(png(1, 1, 3))
+        (self.batch / "c2.png").write_bytes(png(1, 1, 5))
+        conflict = self.write_plan("conflict.json", [
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c1.png"}}, "nodes": ["object-a"]},
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c2.png"}}, "nodes": ["object-a"]},
+        ])
+        report = self.library.plan_retarget(self.asset_id, conflict)
+        self.assertFalse(report["valid"])
+        self.assertTrue(any("重叠" in error for error in report["errors"]))
+        with self.assertRaises(ImportErrorBundle):
+            self.library.apply_retarget(self.asset_id, conflict)
+
+        resolved = self.write_plan("resolved.json", [
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c1.png"}}, "nodes": ["object-a"]},
+            {"tiled_texture": "atlas-color", "priority": 1, "tiles": {"left": {"file": "c2.png"}}, "nodes": ["object-a"]},
+        ])
+        preview = self.library.plan_retarget(self.asset_id, resolved)
+        self.assertTrue(preview["valid"], preview["errors"])
+        states = {item["priority"]: item["tiles"][0]["state"] for item in preview["candidates"]}
+        self.assertEqual(states, {0: "superseded", 1: "adopted"})
+        # 采用结果由 priority 决定，与登记顺序无关
+        swapped = self.write_plan("swapped.json", [
+            {"tiled_texture": "atlas-color", "priority": 1, "tiles": {"left": {"file": "c2.png"}}, "nodes": ["object-a"]},
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c1.png"}}, "nodes": ["object-a"]},
+        ])
+        first, _ = self.library.apply_retarget(self.asset_id, resolved)
+        second, _ = self.library.apply_retarget(self.asset_id, swapped)
+        self.assertEqual(first, second)
+        # 单独采用 c2 的结果与 priority 胜出的结果一致
+        single = self.write_plan("single.json", [
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c2.png"}}, "nodes": ["object-a"]},
+        ])
+        single_asset, _ = self.library.apply_retarget(self.asset_id, single)
+        self.assertEqual(single_asset, first)
+
+    def test_withdraw_one_candidate_input_and_reopen(self) -> None:
+        (self.batch / "c1.png").write_bytes(png(1, 1, 3))
+        (self.batch / "c2.png").write_bytes(png(1, 1, 5))
+        plan = self.write_plan("combined.json", [
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c1.png"}}, "nodes": ["object-a"]},
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c2.png"}}, "nodes": ["object-b"]},
+        ])
+        combined_asset, _ = self.library.apply_retarget(self.asset_id, plan)
+        combined_objects = self.objects(combined_asset)
+        combined_color_a = self.color_texture_id(combined_objects, "object-a")
+        combined_color_b = self.color_texture_id(combined_objects, "object-b")
+
+        withdraw = self.write_plan("withdraw-one.json", [
+            {"withdraw": True, "tiled_texture": combined_color_a, "nodes": ["object-a"]},
+        ])
+        withdrawn_asset, report = self.library.apply_retarget(combined_asset, withdraw)
+        self.assertTrue(report["valid"], report.get("errors"))
+        withdrawn_objects = self.objects(withdrawn_asset)
+        old_objects = self.objects(self.asset_id)
+        old_color = next(oid for oid, item in old_objects.items() if item.get("name") == "atlas-color")
+        # 撤回后 object-a 回到原始组合，object-b 保持自己的候选版本
+        self.assertEqual(self.color_texture_id(withdrawn_objects, "object-a"), old_color)
+        self.assertEqual(self.color_texture_id(withdrawn_objects, "object-b"), combined_color_b)
+        # 已发布资产仍可查看
+        self.assertEqual(self.color_texture_id(self.objects(combined_asset), "object-b"), combined_color_b)
+        # 重开同一组合计划得到同一资产；重复撤回也不增加重复资产
+        reopened, _ = self.library.apply_retarget(self.asset_id, plan)
+        self.assertEqual(reopened, combined_asset)
+        withdrawn_again, _ = self.library.apply_retarget(combined_asset, withdraw)
+        self.assertEqual(withdrawn_again, withdrawn_asset)
+        self.assertEqual(len(json.loads(self.library.index_path.read_text())["assets"]), 3)
+
+    def test_invalid_candidate_cannot_borrow_same_name_same_size_file(self) -> None:
+        (self.batch / "c1.png").write_bytes(png(1, 1, 3))
+        alt = self.batch / "alt"
+        alt.mkdir()
+        (alt / "c1.png").write_bytes(png(1, 1, 7))
+        # 同名同尺寸但内容不同的文件不能互相借用身份
+        plan_a = self.write_plan("only-a.json", [
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c1.png"}}, "nodes": ["object-a"]},
+        ])
+        plan_b = self.write_plan("only-b.json", [
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "alt/c1.png"}}, "nodes": ["object-a"]},
+        ])
+        asset_a, _ = self.library.apply_retarget(self.asset_id, plan_a)
+        asset_b, _ = self.library.apply_retarget(self.asset_id, plan_b)
+        self.assertNotEqual(asset_a, asset_b)
+        objects_a = self.objects(asset_a)
+        objects_b = self.objects(asset_b)
+        left_a = next(t["image_id"] for t in objects_a[self.color_texture_id(objects_a, "object-a")]["tiles"] if t["tile_id"] == "left")
+        left_b = next(t["image_id"] for t in objects_b[self.color_texture_id(objects_b, "object-a")]["tiles"] if t["tile_id"] == "left")
+        self.assertNotEqual(left_a, left_b)
+        # 失效候选整批拒绝，不留下半成品，已发布资产不受影响
+        before = self.library.index_path.read_text()
+        bad = self.write_plan("bad-mix.json", [
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c1.png"}}, "nodes": ["object-a"]},
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "bad.png"}}, "nodes": ["object-b"]},
+        ])
+        report = self.library.plan_retarget(self.asset_id, bad)
+        self.assertFalse(report["valid"])
+        self.assertTrue(any("尺寸关系不合法" in error for error in report["errors"]))
+        with self.assertRaises(ImportErrorBundle):
+            self.library.apply_retarget(self.asset_id, bad)
+        self.assertEqual(before, self.library.index_path.read_text())
+        self.assertEqual(self.color_texture_id(self.objects(asset_a), "object-a"), self.color_texture_id(objects_a, "object-a"))
+
+
 if __name__ == "__main__":
     unittest.main()
