@@ -114,6 +114,25 @@ python3 -m resource3d.cli rollback --library build/library --asset "$NEW_ASSET"
 - 撤回时使用 `{"withdraw": true, "tiled_texture": "...", "nodes": [...]}`，系统从该版各片的 `source_texture_id/source_tile_id/source_image_id` 恢复来源版本，并只为被选节点生成旧组合材质。
 - 预演失败或提交异常时保留既有资产和索引；同一计划重复提交仍得到同一资产 ID，不会发布来源不明的半成品。
 
+### 并行候选与组合采用
+
+同一分片贴图允许登记多个更新候选，系统按对象分别组合采用，而不是按登记顺序覆盖：
+
+```json
+{
+  "tile_updates": [
+    {"tiled_texture": "character-color", "tiles": {"head": {"file": "head-a.png"}}, "nodes": ["hero"], "priority": 1},
+    {"tiled_texture": "character-color", "tiles": {"head": {"file": "head-b.png"}, "body": {"file": "body-b.png"}}}
+  ]
+}
+```
+
+- 同一位置（分片 ID）被多个候选同时提供且作用于同一对象时，必须用 `priority` 明确解决重叠：优先级最高的候选提供该片，优先级相同则整体拒绝并报告冲突候选，绝不按最后登记顺序静默覆盖。
+- 不重叠的分片自动组合采用：每个对象按其适用候选的胜出结果得到自己的组合 `ttx_`，不同对象可以分别保持旧引用或不同组合，内容寻址保证相同组合共享同一身份。
+- 预演报告按分片贴图列出 `candidates`（登记项、优先级、目标节点、分片）、`combinations`（每种组合的新 `ttx_` 与受影响节点）、`affected_nodes`（实际影响对象）与 `base_asset_id`（原资产），每片标注 `source_entry` 指明来自哪个候选。
+- 撤回候选不能与更新候选混合登记同一分片贴图；撤回后重开同一更新仍得到首次发布的同一资产 ID，已发布的各版本资产闭包始终完整可查看。
+- 候选文件按实际字节校验 MIME 与尺寸并内容寻址：同名同尺寸的损坏或不同文件不能借用既有图像身份，重复采用与撤回不会增加重复资产。
+
 ## 快速开始
 
 ```bash
