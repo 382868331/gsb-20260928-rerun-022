@@ -134,6 +134,32 @@ python3 -m resource3d.cli rollback --library build/library --asset "$NEW_ASSET"
 - 失效候选（文件缺失、尺寸或用途不合法）导致整批拒绝，其文件不会进入对象库；同名同尺寸但内容不同的文件按内容寻址生成不同 `img_`，失效或落选候选不能借用同名同尺寸文件的身份。
 - 重复采用同一组合或重复同一撤回都得到同一资产 ID，索引不增加重复资产；撤回某个对象的采用后，其他对象的候选版本保持不变，已发布资产始终可完整导出。
 
+### 瓦片更新的独立审阅记录
+
+重叠候选可以先不解决，操作者把审阅进度保存为一份**与更新计划分开存放**的审阅记录，随时重开接着审：
+
+```bash
+# 打开/刷新审阅记录：列出每个对象上的候选、未解决重叠和当前决定，不发布任何资产
+python3 -m resource3d.cli tile-review \
+  --library build/library --asset "$ASSET" \
+  --plan build/tile-plan.json --review build/tile-review.json
+# 另存一份记录，用于比较另一套选择（保存与切换记录本身都不发布资产）
+python3 -m resource3d.cli tile-review \
+  --library build/library --asset "$ASSET" \
+  --plan build/tile-plan.json --review build/tile-review.json --save-as build/tile-review-alt.json
+# 按审阅记录预演/提交
+python3 -m resource3d.cli retarget \
+  --library build/library --asset "$ASSET" \
+  --plan build/tile-plan.json --review build/tile-review.json --commit
+```
+
+- 审阅记录按“候选 × 对象”逐项保存，决定状态为 `selected`（采用）、`deferred`（该范围暂不采用、继续沿用旧图）或 `undecided`（未决）；尚未解决的重叠写入 `unresolved_overlaps`，重开后原样恢复。
+- 每项决定的 `scope` 记录对象（节点 ID/名称）、片区（分片贴图 ID 与分片 ID）以及候选文件身份（文件路径、文件字节 SHA-256、将生成的 `img_` ID）。
+- 候选文件在保存后被修改时，只有依赖该文件的选择被标记 `needs_recheck`，并在重新确认前阻止发布；其他选择、未决项和未解决重叠全部保留，整份记录不会被清空。文件缺失或尺寸非法的候选同样可以保存待后续处理，但会阻止发布。
+- 计划中已删除的候选不会被静默丢弃，而是标记 `missing_from_plan` 保留在记录里。
+- `--save-as` 产出独立副本：在两份记录上分别做出不同选择再提交，会得到不同资产；仅切换记录或保存记录不发布资产。
+- 提交时只发布 `selected` 的范围；`deferred` 的对象保持旧图身份，仍有未解决重叠或待重新确认选择时整次拒绝。审阅提交复用原有发布路径，因此局部采用、撤回校验和重复操作不增加资产的行为继续有效。
+
 ## 快速开始
 
 ```bash

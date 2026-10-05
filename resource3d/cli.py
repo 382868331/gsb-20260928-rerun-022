@@ -26,8 +26,17 @@ def main(argv: list[str] | None = None) -> int:
     retarget_parser.add_argument("--library", required=True)
     retarget_parser.add_argument("--asset", required=True)
     retarget_parser.add_argument("--plan", required=True)
+    retarget_parser.add_argument("--review")
     retarget_parser.add_argument("--commit", action="store_true")
     retarget_parser.add_argument("--output")
+    review_parser = subparsers.add_parser("tile-review")
+    review_parser.add_argument("--library", required=True)
+    review_parser.add_argument("--asset", required=True)
+    review_parser.add_argument("--plan", required=True)
+    review_parser.add_argument("--review", required=True)
+    review_parser.add_argument("--decisions")
+    review_parser.add_argument("--save-as")
+    review_parser.add_argument("--output")
     rollback_parser = subparsers.add_parser("rollback")
     rollback_parser.add_argument("--library", required=True)
     rollback_parser.add_argument("--asset", required=True)
@@ -39,10 +48,37 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "export":
             print(library.export_inspection(args.asset, args.output))
         elif args.command == "retarget":
-            if args.commit:
+            if args.review:
+                report, published = library.apply_reviewed_tile_plan(
+                    args.asset, args.plan, args.review, commit=args.commit,
+                )
+                if not report.get("valid", True):
+                    for error in report.get("errors", []):
+                        print(f"error: {error}")
+                    payload = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+                    if args.output:
+                        with open(args.output, "w", encoding="utf-8") as handle:
+                            handle.write(payload)
+                    return 2
+            elif args.commit:
                 _, report = library.apply_retarget(args.asset, args.plan)
             else:
                 report = library.plan_retarget(args.asset, args.plan)
+            payload = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            if args.output:
+                with open(args.output, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                print(args.output)
+            else:
+                print(payload, end="")
+        elif args.command == "tile-review":
+            decisions = None
+            if args.decisions:
+                with open(args.decisions, "r", encoding="utf-8") as handle:
+                    decisions = json.load(handle)
+            report = library.save_tile_review(
+                args.asset, args.plan, args.review, decisions=decisions, save_as=args.save_as,
+            )
             payload = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
             if args.output:
                 with open(args.output, "w", encoding="utf-8") as handle:

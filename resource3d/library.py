@@ -10,6 +10,7 @@ from .errors import ImportErrorBundle
 from .gltf import GltfImporter
 from .hashing import canonical_json, sha256_bytes
 from .models import Asset, Geometry, Image, Material, Mesh, Node, Scene, Skin, TextureTile, TiledTexture, Texture
+from .review import DECISION_STATES, candidate_summary, find_overlaps, scan_tile_candidates
 from .retarget import image_dimensions
 
 TEXTURE_USAGES = (
@@ -148,6 +149,323 @@ class ResourceLibrary:
         if not record:
             raise KeyError(f"{asset_id} is not a retargeted asset")
         return record["base_asset_id"]
+
+    def review_tile_plan(
+        self,
+        asset_id: str,
+        plan_path: Path | str,
+        review_path: Path | str | None,
+        decisions: dict[str, object] | None = None,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Open/update an independent review record for a tile update plan.
+
+        The review record lives next to (but separate from) the plan.  It
+        preserves unresolved overlaps, selected candidates and explicitly
+        deferred scopes so the operator can stop and resume reviewing.  When
+        a candidate file changes after a decision was saved, only the
+        decisions that depend on that file are marked ``needs_recheck``;
+        every other decision and pending item is retained.
+        """
+
+        plan_path = Path(plan_path)
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ImportErrorBundle([f"{plan_path}: unreadable or invalid JSON: {exc}"]) from exc
+        if not isinstance(plan, dict) or not isinstance(plan.get("tile_updates"), list):
+            raise ImportErrorBundle([f"{plan_path}: plan must contain a tile_updates list"])
+        plan_sha = sha256_bytes(canonical_json(plan))
+        closure = self._closure(asset_id)
+        candidates, errors = scan_tile_candidates(asset_id, closure, plan_path, plan)
+        # File-level candidate problems are recorded per tile so the review
+        # record can still be saved; they still make the report invalid and
+        # block publication.
+        seen_errors: set[str] = set()
+        for candidate in candidates:
+            for tile in candidate.tiles:
+                if tile.get("error"):
+                    message = (
+                        f"{candidate.label}.tiles[{tile['tile_id']}] @ {candidate.node_name}: {tile['error']}"
+                    )
+                    if message not in seen_errors:
+                        seen_errors.add(message)
+                        errors.append(message)
+
+        saved: dict[str, object] = {}
+        if review_path is not None and Path(review_path).exists():
+            try:
+                saved = json.loads(Path(review_path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ImportErrorBundle([f"{review_path}: 无法读取审阅记录: {exc}"]) from exc
+            if not isinstance(saved, dict) or saved.get("asset_id") != asset_id:
+                raise ImportErrorBundle([f"{review_path}: 审阅记录不属于资产 {asset_id}"])
+        saved_decisions = {
+            item["candidate_id"]: item
+            for item in saved.get("decisions", [])
+            if isinstance(item, dict) and isinstance(item.get("candidate_id"), str)
+        } if isinstance(saved.get("decisions"), list) else {}
+
+        current_file_shas: dict[str, str] = {}
+        invalid_candidate_ids: set[str] = set()
+        for candidate in candidates:
+            for tile in candidate.tiles:
+                if tile["error"] is not None:
+                    invalid_candidate_ids.add(candidate.candidate_id)
+                if tile["file"] is not None and tile["file_sha256"] is not None:
+                    current_file_shas[str(tile["file"])] = str(tile["file_sha256"])
+
+        merged: dict[str, dict[str, object]] = {}
+        # Carry over every previously saved decision, keyed by the content
+        # identity captured when it was saved.
+        for candidate_id, prior in saved_decisions.items():
+            merged[candidate_id] = dict(prior)
+        incoming: dict[str, str] = {}
+        if decisions:
+            raw = decisions.get("decisions")
+            if isinstance(raw, list):
+                for item in raw:
+                    if isinstance(item, dict) and isinstance(item.get("candidate_id"), str):
+                        state = item.get("state")
+                        if state not in DECISION_STATES:
+                            errors.append(f"review: 未知审阅状态 {state!r}")
+                            continue
+                        incoming[str(item["candidate_id"])] = str(state)
+        by_id = {candidate.candidate_id: candidate for candidate in candidates}
+
+        for candidate in candidates:
+            prior = merged.get(candidate.candidate_id)
+            current_scope = {
+                "tiled_texture_id": candidate.tiled_texture_id,
+                "tiled_texture_name": candidate.tiled_texture_name,
+                "node_id": candidate.node_id,
+                "node_name": candidate.node_name,
+                "action": "withdraw" if candidate.withdraw else "adopt",
+                "entry_index": candidate.position,
+                "priority": candidate.priority,
+                "tiles": [
+                    {
+                        "tile_id": tile["tile_id"],
+                        "file": tile["file"],
+                        "file_sha256": tile["file_sha256"],
+                        "image_id": tile["image_id"],
+                    }
+                    for tile in candidate.tiles
+                ],
+            }
+            entry: dict[str, object] = {
+                "candidate_id": candidate.candidate_id,
+                "state": "undecided",
+                "needs_recheck": False,
+                "note": None,
+                "scope": current_scope,
+            }
+            if prior is not None:
+                entry["state"] = prior.get("state", "undecided")
+                entry["note"] = prior.get("note")
+                # The recorded scope keeps the identity the operator last
+                # confirmed; the current scan identity stays separate so a
+                # later reopen keeps flagging the decision until the operator
+                # explicitly reconfirms it.  Other entries and pending items
+                # are untouched.
+                prior_scope = prior.get("scope")
+                if isinstance(prior_scope, dict):
+                    entry["scope"] = prior_scope
+                entry["current_scope"] = current_scope
+                changed_files = []
+                for tile in candidate.tiles:
+                    if tile["file"] is None:
+                        continue
+                    prior_sha = next(
+                        (
+                            saved_tile.get("file_sha256")
+                            for saved_tile in (prior_scope.get("tiles", []) if isinstance(prior_scope, dict) else [])
+                            if isinstance(saved_tile, dict) and saved_tile.get("tile_id") == tile["tile_id"]
+                        ),
+                        None,
+                    )
+                    if prior_sha is not None and prior_sha != tile["file_sha256"]:
+                        changed_files.append(str(tile["file"]))
+                if changed_files and entry["state"] != "undecided":
+                    entry["needs_recheck"] = True
+                    entry["changed_files"] = changed_files
+                elif candidate.candidate_id in invalid_candidate_ids and entry["state"] != "undecided":
+                    entry["needs_recheck"] = True
+                elif prior.get("needs_recheck") and entry["state"] != "undecided":
+                    entry["needs_recheck"] = True
+                    entry["changed_files"] = prior.get("changed_files")
+            if candidate.candidate_id in incoming:
+                entry["state"] = incoming[candidate.candidate_id]
+                # A fresh operator decision re-confirms the current file
+                # identity and clears the re-required-confirmation flag.
+                entry["needs_recheck"] = False
+                entry.pop("changed_files", None)
+                entry["scope"] = current_scope
+                entry.pop("current_scope", None)
+            merged[candidate.candidate_id] = entry
+
+        # Decisions whose candidate vanished from the plan are retained but
+        # flagged, never silently dropped.
+        for candidate_id, prior in list(merged.items()):
+            if candidate_id not in by_id:
+                prior["missing_from_plan"] = True
+
+        ordered = sorted(
+            merged.values(),
+            key=lambda item: (
+                item["scope"].get("entry_index", 1 << 30) if isinstance(item.get("scope"), dict) else 1 << 30,
+                str(item.get("scope", {}).get("node_id", "")) if isinstance(item.get("scope"), dict) else "",
+                str(item.get("candidate_id", "")),
+            ),
+        )
+        overlap_groups = find_overlaps(candidates)
+        decided_candidate_ids = {
+            str(item["candidate_id"])
+            for item in ordered
+            if item.get("state") in ("selected", "deferred")
+        }
+        unresolved_overlaps = [
+            group for group in overlap_groups
+            if not set(group["candidate_ids"]).issubset(decided_candidate_ids)
+        ]
+        review_record = {
+            "version": 1,
+            "kind": "tile-update-review",
+            "asset_id": asset_id,
+            "plan_file": plan_path.name,
+            "plan_sha256": plan_sha,
+            "decisions": ordered,
+            "unresolved_overlaps": unresolved_overlaps,
+        }
+        report = {
+            "asset_id": asset_id,
+            "plan_file": plan_path.name,
+            "plan_sha256": plan_sha,
+            "candidates": [candidate_summary(candidate) for candidate in candidates],
+            "decisions": ordered,
+            "overlaps": overlap_groups,
+            "unresolved_overlaps": unresolved_overlaps,
+            "needs_recheck": [
+                str(item["candidate_id"]) for item in ordered if item.get("needs_recheck")
+            ],
+            "errors": errors,
+            "valid": not errors,
+        }
+        return report, review_record
+
+    def save_tile_review(
+        self,
+        asset_id: str,
+        plan_path: Path | str,
+        review_path: Path | str,
+        decisions: dict[str, object] | None = None,
+        save_as: Path | str | None = None,
+    ) -> dict[str, object]:
+        """Refresh and persist a review record without publishing assets."""
+
+        report, review_record = self.review_tile_plan(asset_id, plan_path, review_path, decisions)
+        target = Path(review_path)
+        payload = canonical_json(review_record) + b"\n"
+        self._atomic_write(target, payload)
+        report["review_file"] = str(target)
+        if save_as is not None:
+            copy_path = Path(save_as)
+            self._atomic_write(copy_path, payload)
+            report["saved_as"] = str(copy_path)
+        return report
+
+    def apply_reviewed_tile_plan(
+        self,
+        asset_id: str,
+        plan_path: Path | str,
+        review_path: Path | str,
+        commit: bool = False,
+    ) -> tuple[dict[str, object], tuple[str, dict[str, object]] | None]:
+        """Build the effective tile update from review selections.
+
+        Only ``selected`` candidates are published; ``deferred`` scopes stay
+        on their old images and ``undecided`` scopes cannot be published while
+        overlaps remain.  The review record itself never publishes assets.
+        """
+
+        report, review_record = self.review_tile_plan(asset_id, plan_path, review_path)
+        errors: list[str] = list(report["errors"])
+        needs_recheck = [
+            item for item in review_record["decisions"]
+            if item.get("needs_recheck") and item.get("state") == "selected"
+        ]
+        for item in needs_recheck:
+            errors.append(
+                f"review: 选择 {item['candidate_id']} 依赖的候选文件已变化，需要重新确认后才能发布"
+            )
+        if report["unresolved_overlaps"]:
+            for group in report["unresolved_overlaps"]:
+                errors.append(
+                    f"{group['node_name']}: 分片 {group['tile_id']!r} 仍有未解决的候选重叠"
+                )
+        if errors:
+            return {**report, "valid": False, "errors": errors}, None
+
+        plan_path = Path(plan_path)
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        selected = [
+            item for item in review_record["decisions"]
+            if item.get("state") == "selected" and not item.get("missing_from_plan")
+        ]
+        # Group selections back by plan entry index and selected node set.
+        selections_by_entry: dict[int, list[dict[str, object]]] = {}
+        for item in selected:
+            scope = item["scope"]
+            selections_by_entry.setdefault(int(scope["entry_index"]), []).append(scope)
+        effective_entries: list[dict[str, object]] = []
+        chosen_positions: dict[tuple[str, str], int] = {}
+        for position, scopes in sorted(selections_by_entry.items()):
+            source_entry = plan["tile_updates"][position]
+            node_ids = sorted({str(scope["node_id"]) for scope in scopes})
+            effective_entries.append({**source_entry, "nodes": node_ids})
+            for scope in scopes:
+                for tile in scope["tiles"]:
+                    if scope["action"] == "withdraw":
+                        continue
+                    key = (str(scope["node_id"]), str(tile["tile_id"]))
+                    if key in chosen_positions and chosen_positions[key] != position:
+                        errors.append(
+                            f"review: 对象 {scope['node_name']} 的分片 {tile['tile_id']!r} "
+                            "被多个已选候选同时采用"
+                        )
+                    chosen_positions[key] = position
+        if not effective_entries:
+            errors.append("review: 没有任何已选择的候选可发布")
+        if errors:
+            return {**report, "valid": False, "errors": errors}, None
+
+        effective_plan = {
+            **{key: value for key, value in plan.items() if key != "tile_updates"},
+            "tile_updates": effective_entries,
+        }
+        fd, temporary_name = tempfile.mkstemp(prefix=".reviewed-plan-", suffix=".json", dir=plan_path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(effective_plan, ensure_ascii=False))
+            effective_path = Path(temporary_name)
+            try:
+                if commit:
+                    new_asset_id, apply_report = self.apply_retarget(asset_id, effective_path)
+                    apply_report["review_file"] = str(review_path)
+                    return apply_report, (new_asset_id, apply_report)
+                preview = self.plan_retarget(asset_id, effective_path)
+                preview["review_file"] = str(review_path)
+                return preview, None
+            finally:
+                try:
+                    effective_path.unlink()
+                except FileNotFoundError:
+                    pass
+        except BaseException:
+            try:
+                Path(temporary_name).unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
     def _prepare_retarget(
         self, asset_id: str, plan_path: Path | str
