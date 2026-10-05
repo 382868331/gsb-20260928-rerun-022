@@ -290,9 +290,12 @@ class ResourceLibrary:
                     entry["changed_files"] = changed_files
                 elif candidate.candidate_id in invalid_candidate_ids and entry["state"] != "undecided":
                     entry["needs_recheck"] = True
-                elif prior.get("needs_recheck") and entry["state"] != "undecided":
-                    entry["needs_recheck"] = True
-                    entry["changed_files"] = prior.get("changed_files")
+                else:
+                    # Recomputed from the current files: restoring a changed
+                    # file to the confirmed bytes clears the stale flag, and
+                    # an unchanged file never flags decisions in this record.
+                    entry["needs_recheck"] = False
+                    entry.pop("changed_files", None)
             if candidate.candidate_id in incoming:
                 entry["state"] = incoming[candidate.candidate_id]
                 # A fresh operator decision re-confirms the current file
@@ -360,17 +363,34 @@ class ResourceLibrary:
         decisions: dict[str, object] | None = None,
         save_as: Path | str | None = None,
     ) -> dict[str, object]:
-        """Refresh and persist a review record without publishing assets."""
+        """Refresh and persist review record(s) without publishing assets.
 
-        report, review_record = self.review_tile_plan(asset_id, plan_path, review_path, decisions)
+        With ``save_as`` the incoming ``decisions`` belong to the copy only:
+        the original record is merely refreshed and keeps the human decisions
+        it already held.  The copy is seeded from the original when it does
+        not exist yet, then tracks its own selections, deferrals and
+        re-confirmations independently.
+        """
+
         target = Path(review_path)
-        payload = canonical_json(review_record) + b"\n"
-        self._atomic_write(target, payload)
+        if save_as is None:
+            report, review_record = self.review_tile_plan(asset_id, plan_path, target, decisions)
+            self._atomic_write(target, canonical_json(review_record) + b"\n")
+            report["review_file"] = str(target)
+            return report
+
+        copy_path = Path(save_as)
+        # Refresh the original without applying the copy's new decisions.
+        _, original_record = self.review_tile_plan(asset_id, plan_path, target, None)
+        self._atomic_write(target, canonical_json(original_record) + b"\n")
+        # A new copy branches from the original record (including its human
+        # decisions); an existing copy continues from its own decisions.
+        if not copy_path.exists():
+            self._atomic_write(copy_path, canonical_json(original_record) + b"\n")
+        report, copy_record = self.review_tile_plan(asset_id, plan_path, copy_path, decisions)
+        self._atomic_write(copy_path, canonical_json(copy_record) + b"\n")
         report["review_file"] = str(target)
-        if save_as is not None:
-            copy_path = Path(save_as)
-            self._atomic_write(copy_path, payload)
-            report["saved_as"] = str(copy_path)
+        report["saved_as"] = str(copy_path)
         return report
 
     def apply_reviewed_tile_plan(

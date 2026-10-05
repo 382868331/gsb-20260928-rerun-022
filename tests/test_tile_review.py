@@ -179,34 +179,35 @@ class TileReviewTests(unittest.TestCase):
 
     def test_save_as_creates_independent_review_without_publishing(self) -> None:
         review = self.batch / "review.json"
-        first = self.library.save_tile_review(self.asset_id, self.plan, review)
+        first = self.library.review_tile_plan(self.asset_id, self.plan, review)[0]
         ids = {
             (candidate["node_name"], tile["file"]): candidate["candidate_id"]
             for candidate in first["candidates"]
             for tile in candidate["tiles"]
             if candidate["node_name"] == "object-a" and tile["file"] in {"c1.png", "c2.png"}
         }
-        before = len(json.loads(self.library.index_path.read_text())["assets"])
-        alternate = self.batch / "review-alt.json"
+        # 原记录先有自己的人工决定
         self.library.save_tile_review(
             self.asset_id, self.plan, review,
             {"decisions": [
                 {"candidate_id": ids[("object-a", "c1.png")], "state": "selected"},
                 {"candidate_id": ids[("object-a", "c2.png")], "state": "deferred"},
             ]},
+        )
+        before = len(json.loads(self.library.index_path.read_text())["assets"])
+        alternate = self.batch / "review-alt.json"
+        self.library.save_tile_review(
+            self.asset_id, self.plan, review,
+            {"decisions": [
+                # 副本最初从原记录分支：这里再改选不会写回原记录
+                {"candidate_id": ids[("object-a", "c2.png")], "state": "selected"},
+                {"candidate_id": ids[("object-a", "c1.png")], "state": "deferred"},
+            ]},
             save_as=alternate,
         )
         # 保存（含另存）本身不发布资产
         self.assertEqual(
             len(json.loads(self.library.index_path.read_text())["assets"]), before,
-        )
-        # 在副本上做出不同选择，两份记录互不影响
-        self.library.save_tile_review(
-            self.asset_id, self.plan, alternate,
-            {"decisions": [
-                {"candidate_id": ids[("object-a", "c2.png")], "state": "selected"},
-                {"candidate_id": ids[("object-a", "c1.png")], "state": "deferred"},
-            ]},
         )
         selected_of = lambda path: [
             item["scope"]["tiles"][0]["file"]
@@ -222,6 +223,95 @@ class TileReviewTests(unittest.TestCase):
             self.asset_id, self.plan, alternate, commit=True,
         )
         self.assertNotEqual(asset_a, asset_b)
+
+    def test_changed_file_is_rechecked_per_record_without_cross_copy_edits(self) -> None:
+        review = self.batch / "review.json"
+        alternate = self.batch / "review-alt.json"
+        scan = self.library.review_tile_plan(self.asset_id, self.plan, review)[0]
+        ids = {
+            (candidate["node_name"], tile["file"]): candidate["candidate_id"]
+            for candidate in scan["candidates"]
+            for tile in candidate["tiles"]
+            if candidate["node_name"] == "object-a"
+        }
+        # 原记录选择 c1；另存出副本后在副本上改选 c2、暂缓 c1
+        self.library.save_tile_review(
+            self.asset_id, self.plan, review,
+            {"decisions": [
+                {"candidate_id": ids[("object-a", "c1.png")], "state": "selected"},
+                {"candidate_id": ids[("object-a", "c2.png")], "state": "deferred"},
+            ]},
+        )
+        self.library.save_tile_review(self.asset_id, self.plan, review, None, save_as=alternate)
+        self.library.save_tile_review(
+            self.asset_id, self.plan, alternate,
+            {"decisions": [
+                {"candidate_id": ids[("object-a", "c2.png")], "state": "selected"},
+                {"candidate_id": ids[("object-a", "c1.png")], "state": "deferred"},
+            ]},
+        )
+        # 修改 c1.png：原记录的 selected(c1) 与副本的 deferred(c1) 各自被标记；
+        # 副本的 selected(c2) 与原记录的 deferred(c2) 不受影响
+        (self.batch / "c1.png").write_bytes(png(1, 1, 9))
+        reopened_original = self.library.review_tile_plan(self.asset_id, self.plan, review)[0]
+        reopened_copy = self.library.review_tile_plan(self.asset_id, self.plan, alternate)[0]
+        flagged_original = {
+            (item["scope"]["tiles"][0]["file"], item["state"])
+            for item in reopened_original["decisions"] if item["needs_recheck"]
+        }
+        flagged_copy = {
+            (item["scope"]["tiles"][0]["file"], item["state"])
+            for item in reopened_copy["decisions"] if item["needs_recheck"]
+        }
+        self.assertEqual(flagged_original, {("c1.png", "selected")})
+        self.assertEqual(flagged_copy, {("c1.png", "deferred")})
+        selected_of = lambda report: [
+            item["scope"]["tiles"][0]["file"]
+            for item in report["decisions"] if item["state"] == "selected"
+        ]
+        self.assertEqual(selected_of(reopened_original), ["c1.png"])
+        self.assertEqual(selected_of(reopened_copy), ["c2.png"])
+        # 只在副本上重新确认暂缓 c1（现文件身份），原记录仍需复核且发布被阻止
+        self.library.save_tile_review(
+            self.asset_id, self.plan, alternate,
+            {"decisions": [
+                {"candidate_id": ids[("object-a", "c1.png")], "state": "deferred"},
+            ]},
+        )
+        blocked, _ = self.library.apply_reviewed_tile_plan(
+            self.asset_id, self.plan, review, commit=True,
+        )
+        self.assertFalse(blocked["valid"])
+        self.assertTrue(any("重新确认" in error for error in blocked["errors"]))
+        # 副本可独立复核后发布；原记录的 c1 选择没有被副本动作改写
+        _, (asset_b, first_report) = self.library.apply_reviewed_tile_plan(
+            self.asset_id, self.plan, alternate, commit=True,
+        )
+        self.assertTrue(first_report["valid"], first_report.get("errors"))
+        still_original = self.library.review_tile_plan(self.asset_id, self.plan, review)[0]
+        self.assertEqual(selected_of(still_original), ["c1.png"])
+        self.assertEqual(still_original["needs_recheck"], [ids[("object-a", "c1.png")]])
+        # 复核原记录（当前文件内容）后发布，得到另一份资产；重复发布不新增资产
+        self.library.save_tile_review(
+            self.asset_id, self.plan, review,
+            {"decisions": [
+                {"candidate_id": ids[("object-a", "c1.png")], "state": "selected"},
+            ]},
+        )
+        _, (asset_a, _) = self.library.apply_reviewed_tile_plan(
+            self.asset_id, self.plan, review, commit=True,
+        )
+        self.assertNotEqual(asset_a, asset_b)
+        before = len(json.loads(self.library.index_path.read_text())["assets"])
+        _, (asset_a_again, _) = self.library.apply_reviewed_tile_plan(
+            self.asset_id, self.plan, review, commit=True,
+        )
+        _, (asset_b_again, _) = self.library.apply_reviewed_tile_plan(
+            self.asset_id, self.plan, alternate, commit=True,
+        )
+        after = len(json.loads(self.library.index_path.read_text())["assets"])
+        self.assertEqual((asset_a_again, asset_b_again), (asset_a, asset_b))
+        self.assertEqual(before, after)
 
     def test_withdraw_choice_remains_valid_through_review(self) -> None:
         adopt = self.batch / "adopt.json"
