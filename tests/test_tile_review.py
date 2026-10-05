@@ -35,15 +35,21 @@ class TileReviewTests(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.temp, ignore_errors=True)
 
-    def write_review_decisions(self, review_path: Path, choices: dict[tuple[str, str], str]) -> None:
-        report = self.library.review_tile_plan(self.asset_id, self.plan, review_path)[0]
+    def write_review_decisions(
+        self,
+        review_path: Path,
+        choices: dict[tuple[str, str], str],
+        plan: Path | None = None,
+    ) -> None:
+        plan = plan or self.plan
+        report = self.library.review_tile_plan(self.asset_id, plan, review_path)[0]
         by_scope = {
             (candidate["node_name"], tile["file"]): candidate["candidate_id"]
             for candidate in report["candidates"]
             for tile in candidate["tiles"]
         }
         self.library.save_tile_review(
-            self.asset_id, self.plan, review_path,
+            self.asset_id, plan, review_path,
             {"decisions": [
                 {"candidate_id": by_scope[scope], "state": state}
                 for scope, state in choices.items()
@@ -179,20 +185,26 @@ class TileReviewTests(unittest.TestCase):
 
     def test_save_as_creates_independent_review_without_publishing(self) -> None:
         review = self.batch / "review.json"
-        first = self.library.save_tile_review(self.asset_id, self.plan, review)
+        # 原记录先保存自己的决定
+        self.write_review_decisions(review, {
+            ("object-a", "c1.png"): "selected",
+            ("object-a", "c2.png"): "deferred",
+        })
+        before = len(json.loads(self.library.index_path.read_text())["assets"])
+        alternate = self.batch / "review-alt.json"
+        report = self.library.review_tile_plan(self.asset_id, self.plan, review)[0]
         ids = {
             (candidate["node_name"], tile["file"]): candidate["candidate_id"]
-            for candidate in first["candidates"]
+            for candidate in report["candidates"]
             for tile in candidate["tiles"]
             if candidate["node_name"] == "object-a" and tile["file"] in {"c1.png", "c2.png"}
         }
-        before = len(json.loads(self.library.index_path.read_text())["assets"])
-        alternate = self.batch / "review-alt.json"
+        # 另存副本，同时为副本改选；这些决定不得写回原文件
         self.library.save_tile_review(
             self.asset_id, self.plan, review,
             {"decisions": [
-                {"candidate_id": ids[("object-a", "c1.png")], "state": "selected"},
-                {"candidate_id": ids[("object-a", "c2.png")], "state": "deferred"},
+                {"candidate_id": ids[("object-a", "c2.png")], "state": "selected"},
+                {"candidate_id": ids[("object-a", "c1.png")], "state": "deferred"},
             ]},
             save_as=alternate,
         )
@@ -200,19 +212,12 @@ class TileReviewTests(unittest.TestCase):
         self.assertEqual(
             len(json.loads(self.library.index_path.read_text())["assets"]), before,
         )
-        # 在副本上做出不同选择，两份记录互不影响
-        self.library.save_tile_review(
-            self.asset_id, self.plan, alternate,
-            {"decisions": [
-                {"candidate_id": ids[("object-a", "c2.png")], "state": "selected"},
-                {"candidate_id": ids[("object-a", "c1.png")], "state": "deferred"},
-            ]},
-        )
         selected_of = lambda path: [
             item["scope"]["tiles"][0]["file"]
             for item in json.loads(path.read_text())["decisions"]
             if item["state"] == "selected"
         ]
+        # 原记录保留自己的决定，副本独立记录改选
         self.assertEqual(selected_of(review), ["c1.png"])
         self.assertEqual(selected_of(alternate), ["c2.png"])
         _, (asset_a, _) = self.library.apply_reviewed_tile_plan(
@@ -222,6 +227,93 @@ class TileReviewTests(unittest.TestCase):
             self.asset_id, self.plan, alternate, commit=True,
         )
         self.assertNotEqual(asset_a, asset_b)
+
+    def test_save_as_copies_stay_independent_through_file_change_and_publish(self) -> None:
+        plan = self.batch / "plan-both.json"
+        plan.write_text(json.dumps({"tile_updates": [
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c1.png"}}, "nodes": ["object-a"]},
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c2.png"}}, "nodes": ["object-a"]},
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c1.png"}}, "nodes": ["object-b"]},
+            {"tiled_texture": "atlas-color", "tiles": {"left": {"file": "c2.png"}}, "nodes": ["object-b"]},
+        ]}))
+        review = self.batch / "review-main.json"
+        alternate = self.batch / "review-alt.json"
+        self.write_review_decisions(review, {
+            ("object-a", "c1.png"): "selected",
+            ("object-a", "c2.png"): "deferred",
+            ("object-b", "c1.png"): "selected",
+            ("object-b", "c2.png"): "deferred",
+        }, plan=plan)
+        report = self.library.review_tile_plan(self.asset_id, plan, review)[0]
+        ids = {
+            (candidate["node_name"], tile["file"]): candidate["candidate_id"]
+            for candidate in report["candidates"]
+            for tile in candidate["tiles"]
+        }
+        self.library.save_tile_review(
+            self.asset_id, plan, review,
+            {"decisions": [
+                {"candidate_id": ids[("object-a", "c2.png")], "state": "selected"},
+                {"candidate_id": ids[("object-a", "c1.png")], "state": "deferred"},
+                {"candidate_id": ids[("object-b", "c1.png")], "state": "selected"},
+                {"candidate_id": ids[("object-b", "c2.png")], "state": "deferred"},
+            ]},
+            save_as=alternate,
+        )
+        selected_of = lambda path: sorted(
+            (item["scope"]["node_name"], item["scope"]["tiles"][0]["file"])
+            for item in json.loads(path.read_text())["decisions"]
+            if item["state"] == "selected"
+        )
+        self.assertEqual(selected_of(review), [("object-a", "c1.png"), ("object-b", "c1.png")])
+        self.assertEqual(selected_of(alternate), [("object-a", "c2.png"), ("object-b", "c1.png")])
+        (self.batch / "c2.png").write_bytes(png(1, 1, 9))
+        flagged_of = lambda path: {
+            (item["scope"]["node_name"], item["scope"]["tiles"][0]["file"])
+            for item in self.library.review_tile_plan(self.asset_id, plan, path)[0]["decisions"]
+            if item.get("needs_recheck")
+        }
+        expected_flags = {("object-a", "c2.png"), ("object-b", "c2.png")}
+        self.assertEqual(flagged_of(review), expected_flags)
+        self.assertEqual(flagged_of(alternate), expected_flags)
+        self.library.save_tile_review(
+            self.asset_id, plan, alternate,
+            {"decisions": [
+                {"candidate_id": ids[("object-a", "c2.png")], "state": "selected"},
+                {"candidate_id": ids[("object-b", "c2.png")], "state": "deferred"},
+            ]},
+        )
+        self.assertEqual(flagged_of(alternate), set())
+        self.assertEqual(flagged_of(review), expected_flags)
+        _, (asset_main, _) = self.library.apply_reviewed_tile_plan(
+            self.asset_id, plan, review, commit=True,
+        )
+        _, (asset_alt, _) = self.library.apply_reviewed_tile_plan(
+            self.asset_id, plan, alternate, commit=True,
+        )
+        self.assertNotEqual(asset_main, asset_alt)
+        main_objects = self.objects(asset_main)
+        alt_objects = self.objects(asset_alt)
+        self.assertNotEqual(
+            self.color_texture_id(main_objects, "object-a"),
+            self.color_texture_id(alt_objects, "object-a"),
+        )
+        self.assertEqual(
+            self.color_texture_id(main_objects, "object-b"),
+            self.color_texture_id(alt_objects, "object-b"),
+        )
+        before = len(json.loads(self.library.index_path.read_text())["assets"])
+        _, (again_main, _) = self.library.apply_reviewed_tile_plan(
+            self.asset_id, plan, review, commit=True,
+        )
+        _, (again_alt, _) = self.library.apply_reviewed_tile_plan(
+            self.asset_id, plan, alternate, commit=True,
+        )
+        self.assertEqual(again_main, asset_main)
+        self.assertEqual(again_alt, asset_alt)
+        self.assertEqual(
+            len(json.loads(self.library.index_path.read_text())["assets"]), before,
+        )
 
     def test_withdraw_choice_remains_valid_through_review(self) -> None:
         adopt = self.batch / "adopt.json"

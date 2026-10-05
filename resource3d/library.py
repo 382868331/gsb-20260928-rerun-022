@@ -363,14 +363,19 @@ class ResourceLibrary:
         """Refresh and persist a review record without publishing assets."""
 
         report, review_record = self.review_tile_plan(asset_id, plan_path, review_path, decisions)
+        if save_as is not None:
+            # Save-as produces an independent copy: the incoming decisions
+            # belong to the copy only, and the original record (including
+            # its own human decisions) is left untouched on disk.
+            copy_path = Path(save_as)
+            self._atomic_write(copy_path, canonical_json(review_record) + b"\n")
+            report["review_file"] = str(copy_path)
+            report["saved_as"] = str(copy_path)
+            return report
         target = Path(review_path)
         payload = canonical_json(review_record) + b"\n"
         self._atomic_write(target, payload)
         report["review_file"] = str(target)
-        if save_as is not None:
-            copy_path = Path(save_as)
-            self._atomic_write(copy_path, payload)
-            report["saved_as"] = str(copy_path)
         return report
 
     def apply_reviewed_tile_plan(
